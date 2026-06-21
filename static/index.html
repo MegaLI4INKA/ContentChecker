@@ -29,6 +29,23 @@
   </div>
 </header>
 
+<!-- TABS -->
+<div class="tabs-bar">
+  <button class="tab-btn active" data-tab="browse">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+    </svg>
+    Просмотр
+  </button>
+  <button class="tab-btn" data-tab="favorites">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+    </svg>
+    Избранное
+    <span class="tab-badge hidden" id="fav-badge">0</span>
+  </button>
+</div>
+
 <!-- LAYOUT -->
 <div class="layout">
 
@@ -61,6 +78,24 @@
         <div id="subfolders-list"></div>
       </div>
 
+      <!-- Best filters -->
+      <div class="sidebar-section" id="best-section">
+        <div class="sidebar-section-title">Избранные папки</div>
+        <div class="star-filter-row">
+          <button class="star-filter-btn" data-target="folder" data-level="0">Все</button>
+          <button class="star-filter-btn" data-target="folder" data-level="1">★</button>
+          <button class="star-filter-btn" data-target="folder" data-level="2">★★</button>
+          <button class="star-filter-btn" data-target="folder" data-level="3">★★★</button>
+        </div>
+        <div class="sidebar-section-title" style="margin-top:10px">Избранные файлы</div>
+        <div class="star-filter-row">
+          <button class="star-filter-btn" data-target="file" data-level="0">Все</button>
+          <button class="star-filter-btn" data-target="file" data-level="1">★</button>
+          <button class="star-filter-btn" data-target="file" data-level="2">★★</button>
+          <button class="star-filter-btn" data-target="file" data-level="3">★★★</button>
+        </div>
+      </div>
+
       <!-- Categories filter -->
       <div class="sidebar-section" id="categories-section">
         <div class="sidebar-section-title">
@@ -80,7 +115,33 @@
         <span id="result-count"></span>
       </div>
       <div class="toolbar-actions">
-        <div class="view-buttons">
+        <!-- Media filter -->
+        <div class="media-filter-btns" id="media-filter-btns">
+          <button class="media-filter-btn active" data-filter="all">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+              <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+            </svg>
+            Все
+          </button>
+          <button class="media-filter-btn" data-filter="videos">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="4" width="20" height="16" rx="2"/>
+              <polygon points="10 9 15 12 10 15"/>
+            </svg>
+            Видео
+          </button>
+          <button class="media-filter-btn" data-filter="photos">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="2"/>
+              <circle cx="8.5" cy="8.5" r="1.5"/>
+              <polyline points="21 15 16 10 5 21"/>
+            </svg>
+            Фото
+          </button>
+        </div>
+        <!-- Grid/List (only in "all" mode) -->
+        <div class="view-buttons" id="view-mode-btns">
           <button id="btn-grid" class="view-btn active" title="Сетка">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
@@ -121,6 +182,20 @@
         </svg>
         <p>Ничего не найдено</p>
       </div>
+    </div>
+
+    <!-- FAVORITES PAGE -->
+    <div id="fav-area" class="hidden">
+      <div class="fav-toolbar">
+        <div class="fav-level-tabs">
+          <button class="fav-level-btn active" data-level="1">★ Все</button>
+          <button class="fav-level-btn" data-level="1" data-exact="1">★ 1 звезда</button>
+          <button class="fav-level-btn" data-level="2" data-exact="2">★★ 2 звезды</button>
+          <button class="fav-level-btn" data-level="3" data-exact="3">★★★ 3 звезды</button>
+        </div>
+        <span id="fav-count" class="toolbar-info"></span>
+      </div>
+      <div id="fav-content"></div>
     </div>
   </main>
 </div>

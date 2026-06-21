@@ -23,6 +23,16 @@ MAX_TEXT_SIZE = 15_000  # chars per text file
 MAX_PHOTOS_IN_CARD = 24
 
 
+def parse_best_level(name: str) -> int:
+    """Count trailing _best tokens in filename stem (max 3)."""
+    stem = Path(name).stem
+    count = 0
+    while stem.endswith("_best"):
+        count += 1
+        stem = stem[:-5]
+    return min(count, 3)
+
+
 def file_type(path: Path) -> str:
     ext = path.suffix.lower()
     if ext in VIDEO_EXTS: return "video"
@@ -137,7 +147,7 @@ def scan_folder(folder: Path, root: Path) -> Optional[dict]:
                 "idx": i,
                 "pos": pos,
             })
-        video_data.append({"name": v.name, "path": str(v), "frames": frames})
+        video_data.append({"name": v.name, "path": str(v), "frames": frames, "best_level": parse_best_level(v.name)})
 
     image_data = []
     for img in images:
@@ -148,6 +158,7 @@ def scan_folder(folder: Path, root: Path) -> Optional[dict]:
             "url": f"/thumb/{tp.name}",
             "cached": tp.exists(),
             "src": str(img),
+            "best_level": parse_best_level(img.name),
         })
 
     text_data = []
@@ -166,6 +177,7 @@ def scan_folder(folder: Path, root: Path) -> Optional[dict]:
         "path": str(folder),
         "rel": rel,
         "parent": folder.parent.name,
+        "best_level": parse_best_level(folder.name),
         "videos": video_data,
         "images": image_data,
         "texts": text_data,
@@ -183,6 +195,9 @@ def browse(
     flat: bool = Query(False),
     search: str = Query(""),
     categories: str = Query(""),
+    min_folder_best: int = Query(0),
+    min_file_best: int = Query(0),
+    media_filter: str = Query("all"),  # "all" | "videos" | "photos"
 ):
     root_path = Path(root).resolve()
     if not root_path.is_dir():
@@ -239,6 +254,15 @@ def browse(
             if data["name"].lower() not in cat_filter and data["parent"].lower() not in cat_filter:
                 continue
 
+        if min_folder_best > 0 and data.get("best_level", 0) < min_folder_best:
+            continue
+
+        if min_file_best > 0:
+            data["videos"] = [v for v in data["videos"] if v.get("best_level", 0) >= min_file_best]
+            data["images"] = [i for i in data["images"] if i.get("best_level", 0) >= min_file_best]
+            if not data["videos"] and not data["images"]:
+                continue
+
         if search_lower:
             folder_hit = search_lower in data["name"].lower()
             vids = [v for v in data["videos"] if search_lower in v["name"].lower()]
@@ -248,6 +272,20 @@ def browse(
             if not folder_hit:
                 data["videos"] = vids
                 data["images"] = imgs
+
+        # Media type filter
+        if media_filter == "videos":
+            if not data["videos"]:
+                continue
+            data["images"] = []
+            data["images_preview"] = []
+            data["images_hidden"] = 0
+            data["total_images"] = 0
+        elif media_filter == "photos":
+            if not data["images"]:
+                continue
+            data["videos"] = []
+            data["total_videos"] = 0
 
         # Limit images shown in card (keep all for count)
         if len(data["images"]) > MAX_PHOTOS_IN_CARD:
@@ -350,6 +388,76 @@ def serve_file(path: str = Query(...)):
     if not p.exists() or not p.is_file():
         raise HTTPException(404)
     return FileResponse(p)
+
+
+@app.get("/api/favorites")
+def get_favorites(root: str = Query(...), min_level: int = Query(1)):
+    root_path = Path(root).resolve()
+    if not root_path.is_dir():
+        raise HTTPException(400, f"Not a directory: {root}")
+
+    fav_folders: list[dict] = []
+    fav_files: list[dict] = []
+
+    def scan_recursive(p: Path, depth: int = 0):
+        if depth > 10:
+            return
+        try:
+            entries = list(p.iterdir())
+        except PermissionError:
+            return
+
+        # Check folder itself (skip root)
+        if p != root_path:
+            folder_level = parse_best_level(p.name)
+            if folder_level >= min_level:
+                data = scan_folder(p, root_path)
+                if data:
+                    if len(data["images"]) > MAX_PHOTOS_IN_CARD:
+                        data["images_preview"] = data["images"][:MAX_PHOTOS_IN_CARD]
+                        data["images_hidden"] = data["total_images"] - MAX_PHOTOS_IN_CARD
+                    else:
+                        data["images_preview"] = data["images"]
+                        data["images_hidden"] = 0
+                    fav_folders.append(data)
+
+        # Check individual files
+        for f in sorted(entries):
+            if not f.is_file():
+                continue
+            ft = file_type(f)
+            if ft not in ("video", "image"):
+                continue
+            flevel = parse_best_level(f.name)
+            if flevel >= min_level:
+                tp = thumb_path(str(f))
+                entry: dict = {
+                    "name": f.name,
+                    "path": str(f),
+                    "best_level": flevel,
+                    "type": ft,
+                    "folder_name": p.name,
+                    "folder_path": str(p),
+                    "url": f"/thumb/{tp.name}",
+                    "src": str(f),
+                    "cached": tp.exists(),
+                    "idx": 0,
+                    "pos": 0.5,
+                }
+                fav_files.append(entry)
+
+        for d in sorted(entries):
+            if d.is_dir():
+                scan_recursive(d, depth + 1)
+
+    scan_recursive(root_path)
+
+    return {
+        "favorite_folders": fav_folders,
+        "favorite_files": fav_files,
+        "total_folders": len(fav_folders),
+        "total_files": len(fav_files),
+    }
 
 
 # Static files must be mounted last
