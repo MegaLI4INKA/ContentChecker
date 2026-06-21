@@ -787,10 +787,21 @@ function setupLazyLoad() {
   document.querySelectorAll("img[data-src]").forEach(img => observer.observe(img));
 }
 
-async function loadThumb(img) {
-  const url  = img.dataset.src;
+function loadThumb(img) {
   const kind = img.dataset.kind;
 
+  if (kind !== "video") {
+    // Images: URL is /api/thumb?src=... — server resizes on-the-fly, browser caches.
+    img.src = img.dataset.src;
+    img.onload = () => {
+      img.classList.add("loaded");
+      img.parentElement?.querySelector(".thumb-placeholder")?.style.setProperty("display", "none");
+    };
+    return;
+  }
+
+  // Videos: try disk-cached /thumb/xxx.jpg, generate frame if missing.
+  const url = img.dataset.src;
   const test = new Image();
   test.onload = () => {
     img.src = url;
@@ -799,9 +810,7 @@ async function loadThumb(img) {
   };
   test.onerror = async () => {
     try {
-      const genUrl = kind === "video"
-        ? `/api/gen-thumb?src=${encodeURIComponent(img.dataset.srcFile)}&idx=${img.dataset.idx}&pos=${img.dataset.pos}&kind=video`
-        : `/api/gen-thumb?src=${encodeURIComponent(img.dataset.srcFile)}&kind=image`;
+      const genUrl = `/api/gen-thumb?src=${encodeURIComponent(img.dataset.srcFile)}&idx=${img.dataset.idx}&pos=${img.dataset.pos}&kind=video`;
       const res = await fetch(genUrl);
       if (res.ok) {
         const data = await res.json();

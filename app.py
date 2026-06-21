@@ -1,12 +1,14 @@
+import io
 import json
 import platform
 import subprocess
 import hashlib
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="ContentChecker")
@@ -49,19 +51,24 @@ def thumb_path(src: str, idx: int = 0) -> Path:
     return THUMB_DIR / f"{thumb_key(src, idx)}.jpg"
 
 
-def make_image_thumb(src: Path, dst: Path) -> bool:
+THUMB_MAX = 700   # px — video frame thumbnail max dimension
+
+
+def resize_image_to_bytes(src: Path, max_dim: int = THUMB_MAX) -> bytes | None:
+    """Resize image in memory, return JPEG bytes. No disk write."""
     try:
         from PIL import Image
         with Image.open(src) as img:
-            img.thumbnail((1600, 1600), Image.LANCZOS)
-            img.convert("RGB").save(dst, "JPEG", quality=90)
-        return True
+            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, "JPEG", quality=82, optimize=True)
+            return buf.getvalue()
     except Exception:
-        return False
+        return None
 
 
 def make_video_thumb(src: Path, dst: Path, position: float) -> bool:
-    # Try opencv first
+    """Extract video frame → save to disk (expensive, worth caching)."""
     try:
         import cv2
         cap = cv2.VideoCapture(str(src))
@@ -72,10 +79,11 @@ def make_video_thumb(src: Path, dst: Path, position: float) -> bool:
         cap.release()
         if ret:
             h, w = frame.shape[:2]
-            scale = min(1600 / w, 1600 / h)
-            if scale < 1.0:  # only downscale, never upscale
-                frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
-            cv2.imwrite(str(dst), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            scale = min(THUMB_MAX / w, THUMB_MAX / h)
+            if scale < 1.0:
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)),
+                                   interpolation=cv2.INTER_LANCZOS4)
+            cv2.imwrite(str(dst), frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
             return True
     except ImportError:
         pass
@@ -84,7 +92,6 @@ def make_video_thumb(src: Path, dst: Path, position: float) -> bool:
 
     # Fallback: ffmpeg
     try:
-        # Get duration
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(src)],
             capture_output=True, text=True, timeout=10
@@ -93,11 +100,11 @@ def make_video_thumb(src: Path, dst: Path, position: float) -> bool:
         if probe.returncode == 0:
             info = json.loads(probe.stdout)
             duration = float(info.get("format", {}).get("duration", 60))
-
         seek = duration * position
         subprocess.run(
             ["ffmpeg", "-ss", str(seek), "-i", str(src),
-             "-vframes", "1", "-vf", "scale=1600:1600:force_original_aspect_ratio=decrease",
+             "-vframes", "1",
+             "-vf", f"scale={THUMB_MAX}:{THUMB_MAX}:force_original_aspect_ratio=decrease",
              "-y", str(dst)],
             capture_output=True, timeout=30
         )
@@ -152,12 +159,10 @@ def scan_folder(folder: Path, root: Path) -> Optional[dict]:
 
     image_data = []
     for img in images:
-        tp = thumb_path(str(img))
         image_data.append({
             "name": img.name,
             "path": str(img),
-            "url": f"/thumb/{tp.name}",
-            "cached": tp.exists(),
+            "url": f"/api/thumb?src={quote(str(img))}",
             "src": str(img),
             "best_level": parse_best_level(img.name),
         })
@@ -415,16 +420,37 @@ def get_thumb(filename: str):
     p = THUMB_DIR / filename
     if not p.exists():
         raise HTTPException(404, "Not cached yet")
-    return FileResponse(p, media_type="image/jpeg")
+    return FileResponse(p, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/api/thumb")
+async def api_thumb(src: str = Query(...), max: int = Query(THUMB_MAX)):
+    """Resize image on-the-fly and stream back. No disk write — browser handles caching.
+    Runs PIL in a thread pool so concurrent requests don't block each other."""
+    import asyncio
+    p = Path(src)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(404)
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, resize_image_to_bytes, p, max)
+    if data is None:
+        raise HTTPException(500, "Could not process image")
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/api/gen-thumb")
 def gen_thumb(
     src: str = Query(...),
     idx: int = Query(0),
-    pos: float = Query(0.1),
-    kind: str = Query("image"),
+    pos: float = Query(0.5),
+    kind: str = Query("video"),
 ):
+    """Generate and cache video frame thumbnails on disk (extraction is expensive)."""
     src_path = Path(src)
     if not src_path.exists():
         raise HTTPException(404, "Source not found")
@@ -433,10 +459,13 @@ def gen_thumb(
     if tp.exists():
         return {"url": f"/thumb/{tp.name}"}
 
-    ok = make_video_thumb(src_path, tp, pos) if kind == "video" else make_image_thumb(src_path, tp)
+    if kind != "video":
+        raise HTTPException(400, "Use /api/thumb for images")
+
+    ok = make_video_thumb(src_path, tp, pos)
     if ok:
         return {"url": f"/thumb/{tp.name}"}
-    raise HTTPException(500, "Thumbnail generation failed")
+    raise HTTPException(500, "Video frame extraction failed")
 
 
 @app.get("/api/open")
@@ -580,7 +609,11 @@ def get_favorites(root: str = Query(...), min_level: int = Query(1)):
                 continue
             flevel = parse_best_level(f.name)
             if flevel >= min_level:
-                tp = thumb_path(str(f))
+                if ft == "image":
+                    url = f"/api/thumb?src={quote(str(f))}"
+                else:
+                    tp = thumb_path(str(f))
+                    url = f"/thumb/{tp.name}"
                 entry: dict = {
                     "name": f.name,
                     "path": str(f),
@@ -588,9 +621,8 @@ def get_favorites(root: str = Query(...), min_level: int = Query(1)):
                     "type": ft,
                     "folder_name": p.name,
                     "folder_path": str(p),
-                    "url": f"/thumb/{tp.name}",
+                    "url": url,
                     "src": str(f),
-                    "cached": tp.exists(),
                     "idx": 0,
                     "pos": 0.5,
                 }
