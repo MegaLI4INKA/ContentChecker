@@ -226,23 +226,46 @@ body {
 .toggle-label input:checked ~ .toggle-track { background: var(--accent); }
 .toggle-label input:checked ~ .toggle-track .toggle-thumb { left: 18px; }
 
-/* Subfolders */
-.subfolder-item {
+/* Folder tree in sidebar */
+.tree-node { display: flex; flex-direction: column; }
+.tree-row {
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 5px 8px;
+  gap: 5px;
+  padding: 4px 6px 4px 2px;
   border-radius: var(--radius-sm);
   cursor: pointer;
   color: var(--text-dim);
-  font-size: 13px;
+  font-size: 12.5px;
   transition: background var(--transition), color var(--transition);
+  min-width: 0;
+}
+.tree-row:hover { background: var(--bg-hover); color: var(--text); }
+.tree-row-active { background: var(--accent-bg); color: var(--accent); }
+.tree-row-active:hover { background: var(--accent-bg); }
+.tree-expand {
+  background: none;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  color: var(--text-mute);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border-radius: 3px;
+  transition: background var(--transition);
+}
+.tree-expand:hover { background: var(--bg-hover); color: var(--text); }
+.tree-arrow { transition: transform 180ms ease; flex-shrink: 0; }
+.tree-name {
+  flex: 1;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.subfolder-item:hover { background: var(--bg-hover); color: var(--text); }
-.subfolder-item svg { color: var(--accent); flex-shrink: 0; }
+.tree-stars { flex-shrink: 0; font-size: 10px; color: #f0c040; }
+.tree-children { margin-left: 8px; border-left: 1px solid var(--border); padding-left: 4px; }
 
 /* Category chips */
 .category-chip {
@@ -390,6 +413,25 @@ body {
 .badge-video { color: #f0a050; border-color: rgba(240,160,80,.3); background: rgba(240,160,80,.08); }
 .badge-photo { color: #50c8f0; border-color: rgba(80,200,240,.3); background: rgba(80,200,240,.08); }
 .badge-text  { color: #80e0a0; border-color: rgba(128,224,160,.3); background: rgba(128,224,160,.08); }
+
+.card-header-actions { display: flex; gap: 6px; flex-shrink: 0; align-items: flex-start; }
+
+.card-nav-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-mute);
+  padding: 5px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: all var(--transition);
+}
+.card-nav-btn:hover { border-color: var(--green); color: var(--green); background: rgba(76,175,125,.1); }
 
 .card-open-btn {
   background: transparent;
@@ -707,6 +749,67 @@ body {
 .modal-nav-btn:disabled { opacity: .3; cursor: default; }
 #modal-counter { font-size: 13px; color: var(--text-dim); min-width: 60px; text-align: center; }
 
+/* ── Photo controls (size + ratio) ────────────────────────────────────────── */
+.photo-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ratio-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-mute);
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--transition);
+}
+.ratio-btn:hover  { border-color: var(--accent); color: var(--accent); }
+.ratio-btn.active { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); }
+
+/* ── Photo grid sizes ──────────────────────────────────────────────────────── */
+.photos-large-grid.size-small  { grid-template-columns: repeat(auto-fill, minmax(90px,  1fr)); gap: 3px; padding: 3px; }
+.photos-large-grid.size-medium { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+.photos-large-grid.size-large  { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 6px; padding: 6px; }
+
+/* ── Natural aspect ratio mode ─────────────────────────────────────────────── */
+.photos-large-grid.natural-ratio-grid { align-items: start; }
+
+.photo-large-cell.natural-ratio {
+  aspect-ratio: unset;
+  height: auto;
+}
+/* img in natural mode: static flow, auto height */
+.photo-large-cell.natural-ratio img {
+  position: static !important;
+  width: 100%;
+  height: auto !important;
+  object-fit: unset !important;
+  opacity: 0;
+  transition: opacity 280ms ease;
+  display: block;
+}
+.photo-large-cell.natural-ratio img.loaded { opacity: 1; }
+/* overlay adapts: always sticks to bottom of the image */
+.photo-large-cell.natural-ratio .photo-name-overlay {
+  position: relative;
+  background: var(--bg-hover);
+  opacity: 1;
+  padding: 4px 8px;
+  font-size: 10.5px;
+  color: var(--text-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.photo-large-cell.natural-ratio .file-star { top: 4px; right: 4px; }
+
 /* ── Media filter buttons ──────────────────────────────────────────────────── */
 .media-filter-btns {
   display: flex;
@@ -998,6 +1101,42 @@ body {
   min-width: 18px;
   text-align: center;
 }
+
+/* ── Sidebar search inputs ─────────────────────────────────────────────────── */
+.sidebar-search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  transition: border-color var(--transition);
+}
+.sidebar-search-wrap:focus-within { border-color: var(--accent); }
+.sidebar-search-wrap svg { color: var(--text-mute); flex-shrink: 0; }
+.sidebar-search-wrap input {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+  width: 100%;
+  min-width: 0;
+}
+.sidebar-search-wrap input::placeholder { color: var(--text-mute); }
+.sidebar-clear-btn {
+  background: none;
+  border: none;
+  color: var(--text-mute);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+  flex-shrink: 0;
+  line-height: 1;
+  transition: color var(--transition);
+}
+.sidebar-clear-btn:hover { color: var(--text); }
 
 /* ── Star filters (sidebar) ────────────────────────────────────────────────── */
 .star-filter-row { display: flex; gap: 4px; flex-wrap: wrap; }

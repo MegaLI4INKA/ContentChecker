@@ -53,8 +53,8 @@ def make_image_thumb(src: Path, dst: Path) -> bool:
     try:
         from PIL import Image
         with Image.open(src) as img:
-            img.thumbnail((480, 360), Image.LANCZOS)
-            img.convert("RGB").save(dst, "JPEG", quality=82)
+            img.thumbnail((1600, 1600), Image.LANCZOS)
+            img.convert("RGB").save(dst, "JPEG", quality=90)
         return True
     except Exception:
         return False
@@ -72,9 +72,10 @@ def make_video_thumb(src: Path, dst: Path, position: float) -> bool:
         cap.release()
         if ret:
             h, w = frame.shape[:2]
-            scale = min(480 / w, 360 / h)
-            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
-            cv2.imwrite(str(dst), frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            scale = min(1600 / w, 1600 / h)
+            if scale < 1.0:  # only downscale, never upscale
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
+            cv2.imwrite(str(dst), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
             return True
     except ImportError:
         pass
@@ -96,7 +97,7 @@ def make_video_thumb(src: Path, dst: Path, position: float) -> bool:
         seek = duration * position
         subprocess.run(
             ["ffmpeg", "-ss", str(seek), "-i", str(src),
-             "-vframes", "1", "-vf", "scale=480:360:force_original_aspect_ratio=decrease",
+             "-vframes", "1", "-vf", "scale=1600:1600:force_original_aspect_ratio=decrease",
              "-y", str(dst)],
             capture_output=True, timeout=30
         )
@@ -193,7 +194,8 @@ def browse(
     root: str = Query(...),
     path: str = Query(""),
     flat: bool = Query(False),
-    search: str = Query(""),
+    search: str = Query(""),         # search by filenames
+    search_folder: str = Query(""),  # search by folder name
     categories: str = Query(""),
     min_folder_best: int = Query(0),
     min_file_best: int = Query(0),
@@ -220,29 +222,33 @@ def browse(
     # Collect folders to scan
     to_scan: list[Path] = []
 
-    if flat:
-        def collect_recursive(p: Path):
-            try:
-                entries = list(p.iterdir())
-            except PermissionError:
-                return
-            has_media = any(
-                file_type(f) in ("video", "image") for f in entries if f.is_file()
-            )
-            if has_media:
-                to_scan.append(p)
-            for d in sorted(entries):
-                if d.is_dir():
-                    collect_recursive(d)
+    def collect_recursive(p: Path):
+        try:
+            entries = list(p.iterdir())
+        except PermissionError:
+            return
+        has_media = any(
+            file_type(f) in ("video", "image") for f in entries if f.is_file()
+        )
+        if has_media:
+            to_scan.append(p)
+        for d in sorted(entries):
+            if d.is_dir():
+                collect_recursive(d)
 
+    # Recursive when flat mode OR when category filter is active
+    # (categories may be deep in the tree, non-recursive scan misses them)
+    cat_filter_active = bool(categories.strip())
+    if flat or cat_filter_active:
         collect_recursive(cur)
     else:
         # Current dir + immediate subfolders
         to_scan = [cur] + [Path(sf["full"]) for sf in subfolders]
 
     # Filters
-    cat_filter = {c.strip().lower() for c in categories.split(",") if c.strip()}
-    search_lower = search.strip().lower()
+    cat_filter        = {c.strip().lower() for c in categories.split(",") if c.strip()}
+    search_file_lower = search.strip().lower()
+    search_folder_lower = search_folder.strip().lower()
 
     result = []
     for folder in to_scan:
@@ -263,15 +269,18 @@ def browse(
             if not data["videos"] and not data["images"]:
                 continue
 
-        if search_lower:
-            folder_hit = search_lower in data["name"].lower()
-            vids = [v for v in data["videos"] if search_lower in v["name"].lower()]
-            imgs = [i for i in data["images"] if search_lower in i["name"].lower()]
-            if not folder_hit and not vids and not imgs:
+        # Folder name search (independent of file search)
+        if search_folder_lower and search_folder_lower not in data["name"].lower():
+            continue
+
+        # File name search (only filters files, not the folder itself)
+        if search_file_lower:
+            vids = [v for v in data["videos"] if search_file_lower in v["name"].lower()]
+            imgs = [i for i in data["images"] if search_file_lower in i["name"].lower()]
+            if not vids and not imgs:
                 continue
-            if not folder_hit:
-                data["videos"] = vids
-                data["images"] = imgs
+            data["videos"] = vids
+            data["images"] = imgs
 
         # Media type filter
         if media_filter == "videos":
@@ -311,6 +320,27 @@ def browse(
         "folders": result,
         "total": len(result),
     }
+
+
+@app.get("/api/children")
+def get_children(root: str = Query(...), path: str = Query("")):
+    """Return immediate subdirectories of a given path (for sidebar tree expansion)."""
+    root_path = Path(root).resolve()
+    cur = (root_path / path).resolve() if path else root_path
+    if not cur.is_dir():
+        raise HTTPException(400, "Not a directory")
+    try:
+        children = sorted(
+            [{"name": e.name,
+              "path": str(e.relative_to(root_path)),
+              "best_level": parse_best_level(e.name),
+              "has_children": any(c.is_dir() for c in e.iterdir())}
+             for e in cur.iterdir() if e.is_dir()],
+            key=lambda x: x["name"].lower(),
+        )
+    except PermissionError:
+        children = []
+    return {"children": children}
 
 
 @app.get("/api/categories")
@@ -388,6 +418,15 @@ def serve_file(path: str = Query(...)):
     if not p.exists() or not p.is_file():
         raise HTTPException(404)
     return FileResponse(p)
+
+
+@app.get("/api/clear-cache")
+def clear_cache():
+    count = 0
+    for f in THUMB_DIR.glob("*.jpg"):
+        f.unlink(missing_ok=True)
+        count += 1
+    return {"deleted": count}
 
 
 @app.get("/api/favorites")

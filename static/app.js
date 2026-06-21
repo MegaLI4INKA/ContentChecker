@@ -3,11 +3,14 @@ const state = {
   root: localStorage.getItem("cc_root") || "",
   path: "",
   flat: false,
-  search: "",
+  search: "",        // filename search
+  searchFolder: "",  // folder name search
   categories: new Set(),
   bestFolder: 0,
   bestFile: 0,
-  mediaFilter: "all",   // "all" | "videos" | "photos"
+  mediaFilter: "all",
+  photoSize: "medium",    // "small" | "medium" | "large"
+  naturalRatio: false,    // true = natural aspect ratio, false = fixed 4:3
   viewMode: "grid",
   page: "browse",
   favLevel: 0,
@@ -28,6 +31,7 @@ function browseUrl() {
     path: state.path,
     flat: state.flat,
     search: state.search,
+    search_folder: state.searchFolder,
     categories: [...state.categories].join(","),
     min_folder_best: state.bestFolder,
     min_file_best: state.bestFile,
@@ -98,27 +102,15 @@ function renderSidebar(data, categories) {
     }
   });
 
-  // Subfolders
-  const sfl = document.getElementById("subfolders-list");
+  // Subfolders tree
+  const sfl   = document.getElementById("subfolders-list");
   const sfSec = document.getElementById("subfolders-section");
   sfl.innerHTML = "";
   if (!data.subfolders.length) {
     sfSec.classList.add("hidden");
   } else {
     sfSec.classList.remove("hidden");
-    data.subfolders.forEach(sf => {
-      const el = document.createElement("div");
-      el.className = "subfolder-item";
-      const stars = starsHtml(sf.best_level || 0);
-      el.innerHTML = `
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
-        </svg>
-        <span title="${sf.full}" style="flex:1;overflow:hidden;text-overflow:ellipsis">${sf.name}</span>
-        ${stars ? `<span class="stars">${stars}</span>` : ""}`;
-      el.addEventListener("click", () => navigate(sf.path));
-      sfl.appendChild(el);
-    });
+    data.subfolders.forEach(sf => sfl.appendChild(buildTreeNode(sf, 0)));
   }
 
   // Best section & star buttons
@@ -126,27 +118,109 @@ function renderSidebar(data, categories) {
   syncStarFilterButtons();
 
   // Categories
-  const catList = document.getElementById("categories-list");
-  const catSec  = document.getElementById("categories-section");
+  const catList  = document.getElementById("categories-list");
+  const catSec   = document.getElementById("categories-section");
+  const catSearch = document.getElementById("cat-search");
   catList.innerHTML = "";
+  // Store full list on the element for client-side filtering
+  catList.dataset.allCats = JSON.stringify(categories);
+
   if (!categories.length) {
     catSec.classList.add("hidden");
   } else {
     catSec.classList.remove("hidden");
-    categories.forEach(cat => {
-      const chip = document.createElement("span");
-      chip.className = "category-chip" + (state.categories.has(cat) ? " active" : "");
-      chip.textContent = cat;
-      chip.addEventListener("click", () => {
-        state.categories.has(cat) ? state.categories.delete(cat) : state.categories.add(cat);
-        load();
-      });
-      catList.appendChild(chip);
+    renderCategoryChips(categories, catList);
+  }
+
+  // Show/hide grid-list buttons (only in "all" mode)
+  document.getElementById("view-mode-btns").classList.toggle("hidden", state.mediaFilter !== "all");
+  // Show/hide photo controls (only in "photos" mode)
+  document.getElementById("photo-controls").classList.toggle("hidden", state.mediaFilter !== "photos");
+}
+
+function buildTreeNode(sf, depth) {
+  const wrap = document.createElement("div");
+  wrap.className = "tree-node";
+  wrap.style.paddingLeft = depth * 12 + "px";
+
+  const stars  = starsHtml(sf.best_level || 0);
+  const active = state.path === sf.path;
+
+  wrap.innerHTML = `
+    <div class="tree-row${active ? " tree-row-active" : ""}">
+      <button class="tree-expand" title="Раскрыть подпапки">
+        <svg class="tree-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2.5" style="opacity:${sf.has_children ? 1 : 0}">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>
+      </button>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+      </svg>
+      <span class="tree-name" title="${sf.path}">${sf.name}</span>
+      ${stars ? `<span class="stars tree-stars">${stars}</span>` : ""}
+    </div>
+    <div class="tree-children hidden"></div>`;
+
+  const row      = wrap.querySelector(".tree-row");
+  const expandBtn = wrap.querySelector(".tree-expand");
+  const arrow    = wrap.querySelector(".tree-arrow");
+  const children = wrap.querySelector(".tree-children");
+
+  // Navigate on row click
+  row.addEventListener("click", e => {
+    if (e.target.closest(".tree-expand")) return;
+    navigate(sf.path);
+  });
+
+  // Expand/collapse on arrow click
+  if (sf.has_children) {
+    let loaded = false;
+    expandBtn.addEventListener("click", async e => {
+      e.stopPropagation();
+      const isOpen = !children.classList.contains("hidden");
+      if (isOpen) {
+        children.classList.add("hidden");
+        arrow.style.transform = "";
+        return;
+      }
+      arrow.style.transform = "rotate(90deg)";
+      children.classList.remove("hidden");
+      if (!loaded) {
+        loaded = true;
+        children.innerHTML = `<div style="padding:4px 0 4px 12px;color:var(--text-mute);font-size:11px">...</div>`;
+        try {
+          const res = await api(`/api/children?root=${encodeURIComponent(state.root)}&path=${encodeURIComponent(sf.path)}`);
+          children.innerHTML = "";
+          res.children.forEach(child => children.appendChild(buildTreeNode(child, 0)));
+          if (!res.children.length) {
+            children.innerHTML = `<div style="padding:4px 0 4px 12px;color:var(--text-mute);font-size:11px">Нет подпапок</div>`;
+          }
+        } catch {
+          children.innerHTML = "";
+        }
+      }
     });
   }
 
-  // Show/hide grid-list buttons (only relevant in "all" mode)
-  document.getElementById("view-mode-btns").classList.toggle("hidden", state.mediaFilter !== "all");
+  return wrap;
+}
+
+function renderCategoryChips(categories, container) {
+  container.innerHTML = "";
+  categories.forEach(cat => {
+    const chip = document.createElement("span");
+    chip.className = "category-chip" + (state.categories.has(cat) ? " active" : "");
+    chip.textContent = cat;
+    chip.addEventListener("click", () => {
+      state.categories.has(cat) ? state.categories.delete(cat) : state.categories.add(cat);
+      load();
+    });
+    container.appendChild(chip);
+  });
+  if (!categories.length) {
+    container.innerHTML = `<span style="font-size:12px;color:var(--text-mute)">Нет совпадений</span>`;
+  }
 }
 
 function syncStarFilterButtons() {
@@ -355,44 +429,35 @@ function renderPhotosMode(folders, container) {
     });
 
     const grid = block.querySelector(".photos-large-grid");
+    grid.className = `photos-large-grid size-${state.photoSize}${state.naturalRatio ? " natural-ratio-grid" : ""}`;
+
     const images = folder.images || [];
-
-    images.forEach(img => {
-      const iBest = img.best_level || 0;
+    const makePhotoCell = (imgData) => {
+      const iBest = imgData.best_level || 0;
+      const natClass = state.naturalRatio ? " natural-ratio" : "";
       const cell = document.createElement("div");
-      cell.className = "photo-large-cell";
+      cell.className = `photo-large-cell${natClass}`;
       cell.innerHTML = `
-        <img data-src="${img.url}" data-src-file="${img.src}" data-kind="image" alt="${img.name}">
+        <img data-src="${imgData.url}" data-src-file="${imgData.src}" data-kind="image" alt="${imgData.name}">
         ${iBest > 0 ? `<span class="file-star">${starsHtml(iBest)}</span>` : ""}
-        <div class="photo-name-overlay">${img.name}</div>`;
-
+        <div class="photo-name-overlay">${imgData.name}</div>`;
       const galleryIdx = state.galleryItems.length;
-      state.galleryItems.push({ src: img.path, name: img.name, type: "image" });
-      cell.addEventListener("click", () => openModal("image", img.path, img.name, galleryIdx));
-      grid.appendChild(cell);
-    });
+      state.galleryItems.push({ src: imgData.path, name: imgData.name, type: "image" });
+      cell.addEventListener("click", () => openModal("image", imgData.path, imgData.name, galleryIdx));
+      return cell;
+    };
+
+    images.forEach(img => grid.appendChild(makePhotoCell(img)));
 
     // Show more
     if (folder.images_hidden > 0) {
       const more = document.createElement("div");
       more.className = "show-more-btn photo-large-cell";
-      more.style.fontSize = "14px";
+      more.style.cssText = "font-size:14px;aspect-ratio:unset;height:60px";
       more.textContent = `+${folder.images_hidden} ещё`;
       more.addEventListener("click", () => {
         more.remove();
-        folder.images.slice(24).forEach(imgData => {
-          const iBest = imgData.best_level || 0;
-          const cell = document.createElement("div");
-          cell.className = "photo-large-cell";
-          cell.innerHTML = `
-            <img data-src="${imgData.url}" data-src-file="${imgData.src}" data-kind="image" alt="${imgData.name}">
-            ${iBest > 0 ? `<span class="file-star">${starsHtml(iBest)}</span>` : ""}
-            <div class="photo-name-overlay">${imgData.name}</div>`;
-          const galleryIdx = state.galleryItems.length;
-          state.galleryItems.push({ src: imgData.path, name: imgData.name, type: "image" });
-          cell.addEventListener("click", () => openModal("image", imgData.path, imgData.name, galleryIdx));
-          grid.appendChild(cell);
-        });
+        folder.images.slice(24).forEach(imgData => grid.appendChild(makePhotoCell(imgData)));
         setupLazyLoad();
       });
       grid.appendChild(more);
@@ -430,15 +495,27 @@ function buildCard(folder) {
         <div class="card-folder-path">${folder.path}</div>
         <div class="card-meta">${badges}</div>
       </div>
-      <button class="card-open-btn" data-path="${folder.path}" title="Открыть в Finder/Explorer">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-          <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
-        </svg>
-        Открыть
-      </button>
+      <div class="card-header-actions">
+        <button class="card-nav-btn" title="Перейти в эту папку">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <polyline points="9 18 15 12 9 6"/>
+          </svg>
+          В папку
+        </button>
+        <button class="card-open-btn" data-path="${folder.path}" title="Открыть в Finder/Explorer">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+            <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+          </svg>
+          Открыть
+        </button>
+      </div>
     </div>`;
 
+  card.querySelector(".card-nav-btn").addEventListener("click", e => {
+    e.stopPropagation();
+    navigate(folder.rel);
+  });
   card.querySelector(".card-open-btn").addEventListener("click", e => {
     e.stopPropagation();
     openLocation(folder.path);
@@ -853,13 +930,87 @@ document.addEventListener("DOMContentLoaded", () => {
       document.querySelectorAll(".media-filter-btn").forEach(b => b.classList.remove("active"));
       btn.classList.add("active");
       state.mediaFilter = btn.dataset.filter;
-      // Show/hide grid-list toggle
       document.getElementById("view-mode-btns").classList.toggle("hidden", state.mediaFilter !== "all");
+      document.getElementById("photo-controls").classList.toggle("hidden", state.mediaFilter !== "photos");
       load();
     });
   });
 
-  clearCats.addEventListener("click", () => { state.categories.clear(); load(); });
+  // Photo size buttons
+  document.querySelectorAll(".size-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".size-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      state.photoSize = btn.dataset.size;
+      // Re-apply size class to all grids without full reload
+      document.querySelectorAll(".photos-large-grid").forEach(grid => {
+        grid.classList.remove("size-small", "size-medium", "size-large");
+        grid.classList.add("size-" + state.photoSize);
+      });
+    });
+  });
+
+  // Natural ratio toggle
+  const ratioBtn   = document.getElementById("ratio-btn");
+  const ratioLabel = document.getElementById("ratio-label");
+  ratioBtn.addEventListener("click", () => {
+    state.naturalRatio = !state.naturalRatio;
+    ratioBtn.classList.toggle("active", state.naturalRatio);
+    ratioLabel.textContent = state.naturalRatio ? "Авто" : "1:1";
+    // Re-apply ratio class to all grids and cells without full reload
+    document.querySelectorAll(".photos-large-grid").forEach(grid => {
+      grid.classList.toggle("natural-ratio-grid", state.naturalRatio);
+    });
+    document.querySelectorAll(".photo-large-cell").forEach(cell => {
+      cell.classList.toggle("natural-ratio", state.naturalRatio);
+    });
+  });
+
+  clearCats.addEventListener("click", () => {
+    state.categories.clear();
+    document.getElementById("cat-search").value = "";
+    load();
+  });
+
+  // Folder name search (sidebar)
+  const folderSearchInput = document.getElementById("folder-search");
+  const folderSearchClear = document.getElementById("folder-search-clear");
+
+  folderSearchInput.addEventListener("input", debounce(e => {
+    state.searchFolder = e.target.value;
+    folderSearchClear.classList.toggle("hidden", !e.target.value);
+    load();
+  }, 280));
+
+  folderSearchClear.addEventListener("click", () => {
+    folderSearchInput.value = "";
+    state.searchFolder = "";
+    folderSearchClear.classList.add("hidden");
+    folderSearchInput.focus();
+    load();
+  });
+
+  // Category search (client-side filter of chips)
+  const catSearchInput = document.getElementById("cat-search");
+  const catSearchClear = document.getElementById("cat-search-clear");
+
+  catSearchInput.addEventListener("input", e => {
+    const q = e.target.value.trim().toLowerCase();
+    catSearchClear.classList.toggle("hidden", !e.target.value);
+    const catList = document.getElementById("categories-list");
+    const all = JSON.parse(catList.dataset.allCats || "[]");
+    const filtered = q ? all.filter(c => c.toLowerCase().includes(q)) : all;
+    renderCategoryChips(filtered, catList);
+  });
+
+  catSearchClear.addEventListener("click", () => {
+    catSearchInput.value = "";
+    catSearchClear.classList.add("hidden");
+    catSearchInput.focus();
+    const catList = document.getElementById("categories-list");
+    const all = JSON.parse(catList.dataset.allCats || "[]");
+    renderCategoryChips(all, catList);
+  });
 
   // Star filter buttons
   document.addEventListener("click", e => {
@@ -912,6 +1063,30 @@ document.addEventListener("DOMContentLoaded", () => {
     if (e.key === "Escape") closeModal();
     if (e.key === "ArrowLeft") modalPrev.click();
     if (e.key === "ArrowRight") modalNext.click();
+  });
+
+  // Clear thumbnail cache
+  const clearCacheBtn = document.getElementById("clear-cache-btn");
+  clearCacheBtn.style.display = "";
+  clearCacheBtn.addEventListener("click", async () => {
+    if (!confirm("Удалить все кешированные превью? Они пересоздадутся в высоком качестве при следующем просмотре.")) return;
+    clearCacheBtn.disabled = true;
+    clearCacheBtn.querySelector("span") && (clearCacheBtn.innerHTML = "⏳ Удаляю...");
+    try {
+      const res = await api("/api/clear-cache");
+      clearCacheBtn.innerHTML = `✓ Удалено ${res.deleted} файлов`;
+      setTimeout(() => {
+        clearCacheBtn.innerHTML = `
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.51"/>
+          </svg> Сбросить кеш`;
+        clearCacheBtn.disabled = false;
+      }, 2000);
+      // Reload so images regenerate lazily
+      load();
+    } catch (e) {
+      clearCacheBtn.disabled = false;
+    }
   });
 
   if (state.root) load();
