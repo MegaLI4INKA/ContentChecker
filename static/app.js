@@ -11,9 +11,11 @@ const state = {
   mediaFilter: "all",
   photoSize: "medium",    // "small" | "medium" | "large"
   naturalRatio: false,    // true = natural aspect ratio, false = fixed 4:3
+  showTexts: false,       // show text file contents in photo mode
   viewMode: "grid",
   page: "browse",
   favLevel: 0,
+  favMediaFilter: "all",  // "all" | "videos" | "photos"
   galleryItems: [],
   galleryIdx: 0,
 };
@@ -106,11 +108,16 @@ function renderSidebar(data, categories) {
   const sfl   = document.getElementById("subfolders-list");
   const sfSec = document.getElementById("subfolders-section");
   sfl.innerHTML = "";
-  if (!data.subfolders.length) {
+
+  if (!data.subfolders.length && !state.searchFolder.trim()) {
     sfSec.classList.add("hidden");
   } else {
     sfSec.classList.remove("hidden");
-    data.subfolders.forEach(sf => sfl.appendChild(buildTreeNode(sf, 0)));
+    if (state.searchFolder.trim()) {
+      renderSearchTree(sfl);            // search mode: async, shows full paths
+    } else {
+      data.subfolders.forEach(sf => sfl.appendChild(buildTreeNode(sf, 0)));
+    }
   }
 
   // Best section & star buttons
@@ -141,20 +148,30 @@ function renderSidebar(data, categories) {
 function buildTreeNode(sf, depth) {
   const wrap = document.createElement("div");
   wrap.className = "tree-node";
-  wrap.style.paddingLeft = depth * 12 + "px";
 
-  const stars  = starsHtml(sf.best_level || 0);
-  const active = state.path === sf.path;
+  const stars       = starsHtml(sf.best_level || 0);
+  const isActive    = state.path === sf.path;
+  const hasChildren = !!sf.has_children;
+
+  // Highlight if matches folder search
+  const searchQ = state.searchFolder.trim().toLowerCase();
+  const isMatch = searchQ && sf.name.toLowerCase().includes(searchQ);
+
+  const rowClass = [
+    "tree-row",
+    isActive ? "tree-row-active" : "",
+    isMatch  ? "tree-row-match"  : "",
+  ].filter(Boolean).join(" ");
 
   wrap.innerHTML = `
-    <div class="tree-row${active ? " tree-row-active" : ""}">
-      <button class="tree-expand" title="Раскрыть подпапки">
+    <div class="${rowClass}" style="padding-left:${depth * 14 + 2}px">
+      <button class="tree-expand" title="Раскрыть подпапки" style="visibility:${hasChildren ? "visible" : "hidden"}">
         <svg class="tree-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none"
-             stroke="currentColor" stroke-width="2.5" style="opacity:${sf.has_children ? 1 : 0}">
+             stroke="currentColor" stroke-width="2.5">
           <polyline points="9 18 15 12 9 6"/>
         </svg>
       </button>
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0">
         <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
       </svg>
       <span class="tree-name" title="${sf.path}">${sf.name}</span>
@@ -162,10 +179,10 @@ function buildTreeNode(sf, depth) {
     </div>
     <div class="tree-children hidden"></div>`;
 
-  const row      = wrap.querySelector(".tree-row");
+  const row       = wrap.querySelector(".tree-row");
   const expandBtn = wrap.querySelector(".tree-expand");
-  const arrow    = wrap.querySelector(".tree-arrow");
-  const children = wrap.querySelector(".tree-children");
+  const arrow     = wrap.querySelector(".tree-arrow");
+  const children  = wrap.querySelector(".tree-children");
 
   // Navigate on row click
   row.addEventListener("click", e => {
@@ -173,37 +190,120 @@ function buildTreeNode(sf, depth) {
     navigate(sf.path);
   });
 
-  // Expand/collapse on arrow click
-  if (sf.has_children) {
+  // Expand/collapse
+  if (hasChildren) {
     let loaded = false;
+    let open   = false;
+
     expandBtn.addEventListener("click", async e => {
       e.stopPropagation();
-      const isOpen = !children.classList.contains("hidden");
-      if (isOpen) {
-        children.classList.add("hidden");
-        arrow.style.transform = "";
-        return;
-      }
-      arrow.style.transform = "rotate(90deg)";
-      children.classList.remove("hidden");
-      if (!loaded) {
+      open = !open;
+      arrow.style.transform = open ? "rotate(90deg)" : "";
+      children.classList.toggle("hidden", !open);
+
+      if (open && !loaded) {
         loaded = true;
-        children.innerHTML = `<div style="padding:4px 0 4px 12px;color:var(--text-mute);font-size:11px">...</div>`;
+        children.innerHTML = `<div class="tree-loading">···</div>`;
         try {
-          const res = await api(`/api/children?root=${encodeURIComponent(state.root)}&path=${encodeURIComponent(sf.path)}`);
+          const res = await api(
+            `/api/children?root=${encodeURIComponent(state.root)}&path=${encodeURIComponent(sf.path)}`
+          );
           children.innerHTML = "";
-          res.children.forEach(child => children.appendChild(buildTreeNode(child, 0)));
-          if (!res.children.length) {
-            children.innerHTML = `<div style="padding:4px 0 4px 12px;color:var(--text-mute);font-size:11px">Нет подпапок</div>`;
+          if (res.children.length) {
+            res.children.forEach(child => children.appendChild(buildTreeNode(child, depth + 1)));
+          } else {
+            children.innerHTML = `<div class="tree-empty">Нет подпапок</div>`;
           }
         } catch {
           children.innerHTML = "";
+          loaded = false;
         }
       }
     });
   }
 
   return wrap;
+}
+
+// ── Search tree (full recursive folder search) ─────────────────────────────
+
+async function renderSearchTree(container) {
+  container.innerHTML = `<div class="tree-loading">Поиск...</div>`;
+  let res;
+  try {
+    res = await api(
+      `/api/search-folders?root=${encodeURIComponent(state.root)}&q=${encodeURIComponent(state.searchFolder)}`
+    );
+  } catch {
+    container.innerHTML = `<div class="tree-empty">Ошибка поиска</div>`;
+    return;
+  }
+
+  container.innerHTML = "";
+  if (!res.results.length) {
+    container.innerHTML = `<div class="tree-empty">Папки не найдены</div>`;
+    return;
+  }
+
+  // Build virtual tree from flat list of results with their path parts.
+  // Intermediate folders (path context) are also added as non-match nodes.
+  const nodeMap = new Map(); // pathKey → {name, path, isMatch, best_level, children:[]}
+
+  res.results.forEach(r => {
+    for (let i = 0; i < r.parts.length; i++) {
+      const key = r.parts.slice(0, i + 1).join("/");
+      if (!nodeMap.has(key)) {
+        nodeMap.set(key, { name: r.parts[i], path: key, isMatch: false, best_level: 0, children: [] });
+      }
+      if (i === r.parts.length - 1) {
+        nodeMap.get(key).isMatch = true;
+        nodeMap.get(key).best_level = r.best_level;
+      }
+    }
+    for (let i = 1; i < r.parts.length; i++) {
+      const parentKey = r.parts.slice(0, i).join("/");
+      const childKey  = r.parts.slice(0, i + 1).join("/");
+      const parent = nodeMap.get(parentKey);
+      const child  = nodeMap.get(childKey);
+      if (parent && child && !parent.children.find(c => c.path === childKey)) {
+        parent.children.push(child);
+      }
+    }
+  });
+
+  // Roots = nodes that are nobody's child
+  const childKeys = new Set();
+  nodeMap.forEach(n => n.children.forEach(c => childKeys.add(c.path)));
+  const roots = [...nodeMap.values()].filter(n => !childKeys.has(n.path));
+
+  function buildSearchNode(node, depth) {
+    const el = document.createElement("div");
+    el.className = "tree-node";
+    el.innerHTML = `
+      <div class="${node.isMatch ? "tree-row tree-row-match" : "tree-row tree-row-path"}"
+           style="padding-left:${depth * 14 + 2}px">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0">
+          <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+        </svg>
+        <span class="tree-name">${node.name}</span>
+        ${node.isMatch && node.best_level ? `<span class="stars tree-stars">${starsHtml(node.best_level)}</span>` : ""}
+      </div>`;
+    el.querySelector(".tree-row").addEventListener("click", () => navigate(node.path));
+    if (node.children.length) {
+      const cc = document.createElement("div");
+      cc.className = "tree-children";
+      node.children.forEach(child => cc.appendChild(buildSearchNode(child, depth + 1)));
+      el.appendChild(cc);
+    }
+    return el;
+  }
+
+  roots.forEach(r => container.appendChild(buildSearchNode(r, 0)));
+
+  const cnt = document.createElement("div");
+  cnt.className = "tree-empty";
+  cnt.textContent = `Найдено: ${res.results.length}`;
+  container.appendChild(cnt);
 }
 
 function renderCategoryChips(categories, container) {
@@ -463,6 +563,33 @@ function renderPhotosMode(folders, container) {
       grid.appendChild(more);
     }
 
+    // Text files below the photo grid
+    if (folder.texts && folder.texts.length) {
+      const textsWrap = document.createElement("div");
+      textsWrap.className = "photo-texts-wrap" + (state.showTexts ? "" : " hidden");
+      folder.texts.forEach(txt => {
+        const tb = document.createElement("div");
+        tb.className = "text-block";
+        tb.innerHTML = `
+          <div class="text-block-header">
+            <span class="text-block-name">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              ${txt.name}
+            </span>
+            <span class="text-block-toggle">▾</span>
+          </div>
+          <div class="text-block-content">${escapeHtml(txt.content)}</div>`;
+        tb.querySelector(".text-block-header").addEventListener("click", () =>
+          tb.classList.toggle("collapsed")
+        );
+        textsWrap.appendChild(tb);
+      });
+      block.appendChild(textsWrap);
+    }
+
     container.appendChild(block);
   });
 }
@@ -706,16 +833,34 @@ async function loadFavorites() {
 function renderFavorites(data) {
   const content = document.getElementById("fav-content");
   content.innerHTML = "";
+  state.galleryItems = [];
 
-  const total = data.total_folders + data.total_files;
+  const mf = state.favMediaFilter;
+
+  // Filter by star level
+  let folders = state.favLevel > 0
+    ? data.favorite_folders.filter(f => f.best_level === state.favLevel)
+    : data.favorite_folders;
+  let files = state.favLevel > 0
+    ? data.favorite_files.filter(f => f.best_level === state.favLevel)
+    : data.favorite_files;
+
+  // Filter by media type
+  if (mf === "videos") { folders = folders.filter(f => f.videos?.length); files = files.filter(f => f.type === "video"); }
+  if (mf === "photos") { folders = folders.filter(f => f.images?.length); files = files.filter(f => f.type === "image"); }
+
+  // Badge counts (use original totals)
+  const rawTotal = data.total_folders + data.total_files;
   document.getElementById("fav-count").textContent =
     `${data.total_folders} папок · ${data.total_files} файлов`;
-
   const badge = document.getElementById("fav-badge");
-  badge.textContent = total;
-  badge.classList.toggle("hidden", total === 0);
+  badge.textContent = rawTotal;
+  badge.classList.toggle("hidden", rawTotal === 0);
 
-  if (!total) {
+  // Show/hide photo controls in fav toolbar
+  document.getElementById("fav-photo-controls").classList.toggle("hidden", mf !== "photos");
+
+  if (!rawTotal) {
     content.innerHTML = `
       <div class="empty-state" style="height:300px">
         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -727,19 +872,27 @@ function renderFavorites(data) {
     return;
   }
 
-  state.galleryItems = [];
+  if (!folders.length && !files.length) {
+    content.innerHTML = `<div class="empty-state" style="height:200px"><p>Нет результатов для выбранного фильтра</p></div>`;
+    return;
+  }
 
-  // Folders section
-  const folders = state.favLevel > 0
-    ? data.favorite_folders.filter(f => f.best_level === state.favLevel)
-    : data.favorite_folders;
+  if (mf === "videos") {
+    renderFavVideos(folders, files, content);
+  } else if (mf === "photos") {
+    renderFavPhotos(folders, files, content);
+  } else {
+    renderFavAll(folders, files, content);
+  }
 
+  setupLazyLoad();
+}
+
+// ── Favorites: All mode ─────────────────────────────────────────────────────
+function renderFavAll(folders, files, content) {
   if (folders.length) {
     const sec = document.createElement("div");
-    const title = document.createElement("div");
-    title.className = "fav-section-title";
-    title.innerHTML = `★ Избранные папки <span class="count">(${folders.length})</span>`;
-    sec.appendChild(title);
+    sec.innerHTML = `<div class="fav-section-title">★ Избранные папки <span class="count">(${folders.length})</span></div>`;
     const grid = document.createElement("div");
     grid.className = "folders-grid";
     folders.forEach(f => grid.appendChild(buildCard(f)));
@@ -747,54 +900,83 @@ function renderFavorites(data) {
     content.appendChild(sec);
   }
 
-  // Files section
-  const files = state.favLevel > 0
-    ? data.favorite_files.filter(f => f.best_level === state.favLevel)
-    : data.favorite_files;
+  // Split individual files by type and render in appropriate mode
+  const videoFiles = files.filter(f => f.type === "video");
+  const imageFiles = files.filter(f => f.type === "image");
 
-  if (files.length) {
+  if (videoFiles.length) {
     const sec = document.createElement("div");
-    const title = document.createElement("div");
-    title.className = "fav-section-title";
-    title.innerHTML = `★ Избранные файлы <span class="count">(${files.length})</span>`;
-    sec.appendChild(title);
+    sec.innerHTML = `<div class="fav-section-title">★ Избранные видео <span class="count">(${videoFiles.length})</span></div>`;
     const grid = document.createElement("div");
-    grid.className = "fav-files-grid";
-
-    files.forEach(file => {
-      const cell = document.createElement("div");
-      cell.className = "fav-file-cell";
-      const isVideo = file.type === "video";
-      cell.innerHTML = `
-        <div class="thumb-wrap">
-          <img data-src="${file.url}" data-src-file="${file.src}"
-               data-idx="${file.idx}" data-pos="${file.pos}"
-               data-kind="${file.type}" alt="${file.name}">
-          <span class="file-star">${starsHtml(file.best_level)}</span>
-          ${isVideo ? `<div class="thumb-play-overlay">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="white" stroke="none"><polygon points="5 3 19 12 5 21"/></svg>
-          </div>` : ""}
-        </div>
-        <div class="fav-file-info">
-          <div class="fav-file-name" title="${file.name}">${file.name}</div>
-          <div class="fav-file-folder" title="${file.folder_path}">📁 ${file.folder_name}</div>
-        </div>
-        <button class="fav-open-btn" title="Открыть расположение">↗</button>`;
-
-      cell.querySelector(".fav-open-btn").addEventListener("click", e => {
-        e.stopPropagation(); openLocation(file.path);
-      });
-      const idx = state.galleryItems.length;
-      state.galleryItems.push({ src: file.path, name: file.name, type: file.type });
-      cell.addEventListener("click", () => openModal(file.type, file.path, file.name, idx));
-      grid.appendChild(cell);
-    });
-
+    grid.className = "videos-grid";
+    videoFiles.forEach(file => grid.appendChild(buildVideoCard(fileToVideo(file), fileToFolder(file))));
     sec.appendChild(grid);
     content.appendChild(sec);
   }
 
-  setupLazyLoad();
+  if (imageFiles.length) {
+    const sec = document.createElement("div");
+    sec.innerHTML = `<div class="fav-section-title">★ Избранные фото <span class="count">(${imageFiles.length})</span></div>`;
+    const synth = makeSynthFolder("Избранные фото", imageFiles);
+    const wrap = document.createElement("div");
+    wrap.className = "photos-only-container";
+    renderPhotosMode([synth], wrap);
+    sec.appendChild(wrap);
+    content.appendChild(sec);
+  }
+}
+
+// ── Favorites: Videos mode ──────────────────────────────────────────────────
+function renderFavVideos(folders, files, content) {
+  const grid = document.createElement("div");
+  grid.className = "videos-grid";
+
+  folders.forEach(folder => {
+    (folder.videos || []).forEach(video => grid.appendChild(buildVideoCard(video, folder)));
+  });
+  files.forEach(file => grid.appendChild(buildVideoCard(fileToVideo(file), fileToFolder(file))));
+
+  content.appendChild(grid);
+}
+
+// ── Favorites: Photos mode ──────────────────────────────────────────────────
+function renderFavPhotos(folders, files, content) {
+  const allFolders = [...folders];
+  if (files.length) allFolders.push(makeSynthFolder("Избранные фото", files));
+  renderPhotosMode(allFolders, content);
+}
+
+// ── Helpers: convert individual fav file to video/folder objects ────────────
+function fileToVideo(file) {
+  return {
+    name: file.name,
+    path: file.path,
+    best_level: file.best_level,
+    frames: [{ url: file.url, src: file.src, idx: file.idx ?? 0, pos: file.pos ?? 0.5 }],
+  };
+}
+
+function fileToFolder(file) {
+  return { name: file.folder_name, path: file.folder_path };
+}
+
+function makeSynthFolder(name, imageFiles) {
+  const images = imageFiles.map(f => ({
+    name: f.name,
+    path: f.path,
+    url: f.url,
+    src: f.src,
+    best_level: f.best_level,
+  }));
+  return {
+    name,
+    path: imageFiles[0]?.folder_path || "",
+    best_level: 0,
+    images,
+    total_images: images.length,
+    images_hidden: 0,
+    texts: [],
+  };
 }
 
 /* ── Modal ─────────────────────────────────────────────────────────────────── */
@@ -957,12 +1139,21 @@ document.addEventListener("DOMContentLoaded", () => {
     state.naturalRatio = !state.naturalRatio;
     ratioBtn.classList.toggle("active", state.naturalRatio);
     ratioLabel.textContent = state.naturalRatio ? "Авто" : "1:1";
-    // Re-apply ratio class to all grids and cells without full reload
     document.querySelectorAll(".photos-large-grid").forEach(grid => {
       grid.classList.toggle("natural-ratio-grid", state.naturalRatio);
     });
     document.querySelectorAll(".photo-large-cell").forEach(cell => {
       cell.classList.toggle("natural-ratio", state.naturalRatio);
+    });
+  });
+
+  const showTextsBtn   = document.getElementById("show-texts-btn");
+  showTextsBtn.addEventListener("click", () => {
+    state.showTexts = !state.showTexts;
+    showTextsBtn.classList.toggle("active", state.showTexts);
+    // Instantly show/hide all text wraps without reload
+    document.querySelectorAll(".photo-texts-wrap").forEach(w => {
+      w.classList.toggle("hidden", !state.showTexts);
     });
   });
 
@@ -1037,6 +1228,59 @@ document.addEventListener("DOMContentLoaded", () => {
       state.favLevel = parseInt(btn.dataset.exact || "0");
       loadFavorites();
     });
+  });
+
+  // Favorites media filter (all / videos / photos)
+  document.querySelectorAll("[data-fav-filter]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("[data-fav-filter]").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      state.favMediaFilter = btn.dataset.favFilter;
+      loadFavorites();
+    });
+  });
+
+  // Favorites photo size buttons (share state.photoSize with browse)
+  document.querySelectorAll(".fav-size-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".fav-size-btn").forEach(b => b.classList.remove("active"));
+      // Also sync browse size buttons
+      document.querySelectorAll(".size-btn").forEach(b =>
+        b.classList.toggle("active", b.dataset.size === btn.dataset.size)
+      );
+      btn.classList.add("active");
+      state.photoSize = btn.dataset.size;
+      document.querySelectorAll(".photos-large-grid").forEach(g => {
+        g.className = `photos-large-grid size-${state.photoSize}${state.naturalRatio ? " natural-ratio-grid" : ""}`;
+      });
+    });
+  });
+
+  // Fav ratio toggle (shares state.naturalRatio)
+  const favRatioBtn   = document.getElementById("fav-ratio-btn");
+  const favRatioLabel = document.getElementById("fav-ratio-label");
+  favRatioBtn.addEventListener("click", () => {
+    state.naturalRatio = !state.naturalRatio;
+    favRatioBtn.classList.toggle("active", state.naturalRatio);
+    document.getElementById("ratio-btn").classList.toggle("active", state.naturalRatio);
+    favRatioLabel.textContent = state.naturalRatio ? "Авто" : "1:1";
+    document.getElementById("ratio-label").textContent = favRatioLabel.textContent;
+    document.querySelectorAll(".photos-large-grid").forEach(g =>
+      g.classList.toggle("natural-ratio-grid", state.naturalRatio)
+    );
+    document.querySelectorAll(".photo-large-cell").forEach(c =>
+      c.classList.toggle("natural-ratio", state.naturalRatio)
+    );
+  });
+
+  // Fav texts toggle (shares state.showTexts)
+  document.getElementById("fav-show-texts-btn").addEventListener("click", () => {
+    state.showTexts = !state.showTexts;
+    document.getElementById("fav-show-texts-btn").classList.toggle("active", state.showTexts);
+    document.getElementById("show-texts-btn").classList.toggle("active", state.showTexts);
+    document.querySelectorAll(".photo-texts-wrap").forEach(w =>
+      w.classList.toggle("hidden", !state.showTexts)
+    );
   });
 
   // Modal

@@ -265,7 +265,22 @@ body {
   text-overflow: ellipsis;
 }
 .tree-stars { flex-shrink: 0; font-size: 10px; color: #f0c040; }
-.tree-children { margin-left: 8px; border-left: 1px solid var(--border); padding-left: 4px; }
+.tree-children { border-left: 1px solid var(--border); margin-left: 14px; }
+
+/* Search highlight in tree */
+.tree-row-match {
+  background: rgba(240,192,64,.13) !important;
+}
+.tree-row-match .tree-name { color: #e8b840; font-weight: 600; }
+.tree-row-match:hover { background: rgba(240,192,64,.2) !important; }
+
+/* Path-context nodes (parent of a match, not match itself) */
+.tree-row-path { opacity: .75; }
+.tree-row-path .tree-name { color: var(--text-dim); }
+.tree-row-path:hover { opacity: 1; background: var(--bg-hover); }
+
+.tree-loading { padding: 4px 8px; color: var(--text-mute); font-size: 11px; }
+.tree-empty   { padding: 4px 8px; color: var(--text-mute); font-size: 11px; font-style: italic; }
 
 /* Category chips */
 .category-chip {
@@ -987,6 +1002,15 @@ body {
   border-radius: var(--radius);
   overflow: hidden;
 }
+.photo-texts-wrap {
+  border-top: 1px solid var(--border);
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.photo-texts-wrap .text-block { margin: 0; }
+.photo-texts-wrap.hidden { display: none; }
 .photo-folder-block-header {
   display: flex;
   align-items: center;
@@ -1199,6 +1223,8 @@ body {
   flex-wrap: wrap;
 }
 .fav-level-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+#fav-media-filter { }
+#fav-photo-controls { border-left: 1px solid var(--border); padding-left: 12px; }
 .fav-level-btn {
   background: transparent;
   border: 1px solid var(--border);

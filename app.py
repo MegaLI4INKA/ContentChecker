@@ -209,10 +209,22 @@ def browse(
     if not cur.is_dir():
         raise HTTPException(400, f"Not a directory: {cur}")
 
+    def _has_subdirs(p: Path) -> bool:
+        try:
+            return any(c.is_dir() for c in p.iterdir())
+        except PermissionError:
+            return False
+
     # Immediate subfolders (for sidebar)
     try:
         subfolders = sorted(
-            [{"name": e.name, "path": str(e.relative_to(root_path)), "full": str(e)}
+            [{
+                "name": e.name,
+                "path": str(e.relative_to(root_path)),
+                "full": str(e),
+                "best_level": parse_best_level(e.name),
+                "has_children": _has_subdirs(e),
+            }
              for e in cur.iterdir() if e.is_dir()],
             key=lambda x: x["name"].lower(),
         )
@@ -320,6 +332,39 @@ def browse(
         "folders": result,
         "total": len(result),
     }
+
+
+@app.get("/api/search-folders")
+def search_folders(root: str = Query(...), q: str = Query(...)):
+    root_path = Path(root).resolve()
+    if not root_path.is_dir():
+        raise HTTPException(400)
+
+    q_lower = q.strip().lower()
+    if not q_lower:
+        return {"results": []}
+
+    results: list[dict] = []
+
+    def scan(p: Path):
+        try:
+            for e in sorted(p.iterdir()):
+                if not e.is_dir():
+                    continue
+                if q_lower in e.name.lower():
+                    rel = e.relative_to(root_path)
+                    results.append({
+                        "name": e.name,
+                        "path": "/".join(rel.parts),
+                        "parts": list(rel.parts),
+                        "best_level": parse_best_level(e.name),
+                    })
+                scan(e)
+        except PermissionError:
+            pass
+
+    scan(root_path)
+    return {"results": results[:300]}
 
 
 @app.get("/api/children")
