@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ContentChecker</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- TOP BAR -->
+<header class="topbar">
+  <div class="topbar-brand">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+      <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+    </svg>
+    <span>ContentChecker</span>
+  </div>
+  <div class="topbar-path">
+    <input id="root-input" type="text" placeholder="Путь к папке, например: /Users/you/media" autocomplete="off" spellcheck="false">
+    <button id="load-btn" class="btn-primary">Открыть</button>
+  </div>
+  <div class="topbar-search">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+    </svg>
+    <input id="search-input" type="text" placeholder="Поиск по файлам..." autocomplete="off">
+  </div>
+</header>
+
+<!-- LAYOUT -->
+<div class="layout">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-empty" id="sidebar-empty">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+      </svg>
+      <p>Укажите путь к папке</p>
+    </div>
+
+    <div id="sidebar-content" class="hidden">
+      <!-- Breadcrumbs -->
+      <nav id="breadcrumbs" class="breadcrumbs"></nav>
+
+      <!-- View mode -->
+      <div class="sidebar-section">
+        <div class="sidebar-section-title">Режим просмотра</div>
+        <label class="toggle-label">
+          <input type="checkbox" id="flat-toggle">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span>Всё в одном списке</span>
+        </label>
+      </div>
+
+      <!-- Subfolders -->
+      <div class="sidebar-section" id="subfolders-section">
+        <div class="sidebar-section-title">Подпапки</div>
+        <div id="subfolders-list"></div>
+      </div>
+
+      <!-- Categories filter -->
+      <div class="sidebar-section" id="categories-section">
+        <div class="sidebar-section-title">
+          Фильтр категорий
+          <button class="btn-link" id="clear-cats">Сбросить</button>
+        </div>
+        <div id="categories-list"></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main">
+    <!-- Toolbar -->
+    <div class="toolbar" id="toolbar">
+      <div class="toolbar-info">
+        <span id="result-count"></span>
+      </div>
+      <div class="toolbar-actions">
+        <div class="view-buttons">
+          <button id="btn-grid" class="view-btn active" title="Сетка">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+              <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+            </svg>
+          </button>
+          <button id="btn-list" class="view-btn" title="Список">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
+              <line x1="8" y1="18" x2="21" y2="18"/>
+              <line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/>
+              <line x1="3" y1="18" x2="3.01" y2="18"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Content area -->
+    <div id="content-area">
+      <div class="welcome" id="welcome">
+        <div class="welcome-icon">
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+          </svg>
+        </div>
+        <h2>Добро пожаловать в ContentChecker</h2>
+        <p>Введите путь к папке с медиафайлами выше, чтобы начать просмотр</p>
+      </div>
+      <div id="folders-container" class="folders-grid hidden"></div>
+      <div id="loading" class="loading hidden">
+        <div class="spinner"></div>
+        <p>Загрузка...</p>
+      </div>
+      <div id="empty-state" class="empty-state hidden">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+        </svg>
+        <p>Ничего не найдено</p>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- PREVIEW MODAL -->
+<div id="modal" class="modal hidden" role="dialog">
+  <div class="modal-backdrop" id="modal-backdrop"></div>
+  <div class="modal-window">
+    <div class="modal-header">
+      <span id="modal-title" class="modal-title"></span>
+      <div class="modal-actions">
+        <button id="modal-open" class="btn-icon" title="Открыть расположение">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+            <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+          </svg>
+        </button>
+        <button id="modal-close" class="btn-icon" title="Закрыть">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+    <div class="modal-nav hidden" id="modal-nav">
+      <button id="modal-prev" class="modal-nav-btn">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="15 18 9 12 15 6"/>
+        </svg>
+      </button>
+      <span id="modal-counter"></span>
+      <button id="modal-next" class="modal-nav-btn">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
