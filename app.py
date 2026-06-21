@@ -5,8 +5,8 @@ import hashlib
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="ContentChecker")
@@ -457,12 +457,78 @@ def open_location(path: str = Query(...)):
         raise HTTPException(500, str(e))
 
 
+_MIME = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo", ".mkv": "video/x-matroska",
+    ".webm": "video/webm", ".wmv": "video/x-ms-wmv",
+    ".flv": "video/x-flv", ".ts": "video/mp2t",
+    ".3gp": "video/3gpp", ".mts": "video/mp2t", ".m2ts": "video/mp2t",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png", ".gif": "image/gif",
+    ".webp": "image/webp", ".heic": "image/heic", ".heif": "image/heif",
+    ".txt": "text/plain", ".md": "text/markdown",
+    ".pdf": "application/pdf",
+}
+
+
 @app.get("/file")
-def serve_file(path: str = Query(...)):
+def serve_file(request: Request, path: str = Query(...)):
     p = Path(path)
     if not p.exists() or not p.is_file():
         raise HTTPException(404)
-    return FileResponse(p)
+
+    file_size = p.stat().st_size
+    media_type = _MIME.get(p.suffix.lower(), "application/octet-stream")
+    range_header = request.headers.get("Range")
+
+    CHUNK = 1 << 16  # 64 KB
+
+    def stream_range(start: int, end: int):
+        with open(p, "rb") as f:
+            f.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                data = f.read(min(CHUNK, remaining))
+                if not data:
+                    break
+                yield data
+                remaining -= len(data)
+
+    if not range_header:
+        # Full file with Accept-Ranges so browser knows seeking is supported
+        return StreamingResponse(
+            stream_range(0, file_size - 1),
+            media_type=media_type,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(file_size),
+            },
+        )
+
+    # Parse "bytes=start-end" (end may be omitted)
+    try:
+        raw = range_header.strip().removeprefix("bytes=")
+        s, e = raw.split("-")
+        start = int(s)
+        end = int(e) if e else file_size - 1
+        end = min(end, file_size - 1)
+    except Exception:
+        raise HTTPException(416, "Invalid Range header")
+
+    if start > end or start >= file_size:
+        raise HTTPException(416, "Range Not Satisfiable")
+
+    chunk_len = end - start + 1
+    return StreamingResponse(
+        stream_range(start, end),
+        status_code=206,
+        media_type=media_type,
+        headers={
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(chunk_len),
+        },
+    )
 
 
 @app.get("/api/clear-cache")
