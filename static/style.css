@@ -997,6 +997,7 @@ body {
 .photos-only-container { display: flex; flex-direction: column; gap: 20px; }
 
 .photo-folder-block {
+  flex-shrink: 0;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
