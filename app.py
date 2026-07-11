@@ -35,6 +35,12 @@ def parse_best_level(name: str) -> int:
     return min(count, 3)
 
 
+def has_wallpaper_tag(name: str) -> bool:
+    """True if the filename stem has a standalone _wallpaper token."""
+    stem = Path(name).stem.lower()
+    return "wallpaper" in stem.split("_")
+
+
 def file_type(path: Path) -> str:
     ext = path.suffix.lower()
     if ext in VIDEO_EXTS: return "video"
@@ -155,7 +161,11 @@ def scan_folder(folder: Path, root: Path) -> Optional[dict]:
                 "idx": i,
                 "pos": pos,
             })
-        video_data.append({"name": v.name, "path": str(v), "frames": frames, "best_level": parse_best_level(v.name)})
+        video_data.append({
+            "name": v.name, "path": str(v), "frames": frames,
+            "best_level": parse_best_level(v.name),
+            "is_wallpaper": has_wallpaper_tag(v.name),
+        })
 
     image_data = []
     for img in images:
@@ -165,6 +175,7 @@ def scan_folder(folder: Path, root: Path) -> Optional[dict]:
             "url": f"/api/thumb?src={quote(str(img))}",
             "src": str(img),
             "best_level": parse_best_level(img.name),
+            "is_wallpaper": has_wallpaper_tag(img.name),
         })
 
     text_data = []
@@ -184,6 +195,7 @@ def scan_folder(folder: Path, root: Path) -> Optional[dict]:
         "rel": rel,
         "parent": folder.parent.name,
         "best_level": parse_best_level(folder.name),
+        "is_wallpaper": has_wallpaper_tag(folder.name),
         "videos": video_data,
         "images": image_data,
         "texts": text_data,
@@ -639,6 +651,76 @@ def get_favorites(root: str = Query(...), min_level: int = Query(1)):
         "favorite_files": fav_files,
         "total_folders": len(fav_folders),
         "total_files": len(fav_files),
+    }
+
+
+@app.get("/api/wallpapers")
+def get_wallpapers(root: str = Query(...)):
+    root_path = Path(root).resolve()
+    if not root_path.is_dir():
+        raise HTTPException(400, f"Not a directory: {root}")
+
+    wp_folders: list[dict] = []
+    wp_files: list[dict] = []
+
+    def scan_recursive(p: Path, depth: int = 0):
+        if depth > 10:
+            return
+        try:
+            entries = list(p.iterdir())
+        except PermissionError:
+            return
+
+        # Check folder itself (skip root)
+        if p != root_path and has_wallpaper_tag(p.name):
+            data = scan_folder(p, root_path)
+            if data:
+                if len(data["images"]) > MAX_PHOTOS_IN_CARD:
+                    data["images_preview"] = data["images"][:MAX_PHOTOS_IN_CARD]
+                    data["images_hidden"] = data["total_images"] - MAX_PHOTOS_IN_CARD
+                else:
+                    data["images_preview"] = data["images"]
+                    data["images_hidden"] = 0
+                wp_folders.append(data)
+
+        # Check individual files
+        for f in sorted(entries):
+            if not f.is_file():
+                continue
+            ft = file_type(f)
+            if ft not in ("video", "image"):
+                continue
+            if has_wallpaper_tag(f.name):
+                if ft == "image":
+                    url = f"/api/thumb?src={quote(str(f))}"
+                else:
+                    tp = thumb_path(str(f))
+                    url = f"/thumb/{tp.name}"
+                entry: dict = {
+                    "name": f.name,
+                    "path": str(f),
+                    "best_level": parse_best_level(f.name),
+                    "type": ft,
+                    "folder_name": p.name,
+                    "folder_path": str(p),
+                    "url": url,
+                    "src": str(f),
+                    "idx": 0,
+                    "pos": 0.5,
+                }
+                wp_files.append(entry)
+
+        for d in sorted(entries):
+            if d.is_dir():
+                scan_recursive(d, depth + 1)
+
+    scan_recursive(root_path)
+
+    return {
+        "wallpaper_folders": wp_folders,
+        "wallpaper_files": wp_files,
+        "total_folders": len(wp_folders),
+        "total_files": len(wp_files),
     }
 
 

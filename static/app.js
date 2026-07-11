@@ -16,6 +16,7 @@ const state = {
   page: "browse",
   favLevel: 0,
   favMediaFilter: "all",  // "all" | "videos" | "photos"
+  wpMediaFilter: "all",   // "all" | "videos" | "photos" — wallpapers tab
   galleryItems: [],
   galleryIdx: 0,
 };
@@ -46,6 +47,10 @@ function favUrl(minLevel = 1) {
   return `/api/favorites?root=${encodeURIComponent(state.root)}&min_level=${minLevel}`;
 }
 
+function wpUrl() {
+  return `/api/wallpapers?root=${encodeURIComponent(state.root)}`;
+}
+
 function categoriesUrl() {
   return `/api/categories?root=${encodeURIComponent(state.root)}&path=${encodeURIComponent(state.path)}`;
 }
@@ -56,6 +61,8 @@ async function load() {
   localStorage.setItem("cc_root", state.root);
   if (state.page === "favorites") {
     await loadFavorites();
+  } else if (state.page === "wallpapers") {
+    await loadWallpapers();
   } else {
     await loadBrowse();
   }
@@ -897,11 +904,16 @@ function renderFavorites(data) {
   setupLazyLoad();
 }
 
-// ── Favorites: All mode ─────────────────────────────────────────────────────
-function renderFavAll(folders, files, content) {
+// ── Tag collection: All mode (used by Favorites and Wallpapers) ────────────
+function renderFavAll(folders, files, content, labels = {}) {
+  const l = {
+    icon: "★", folders: "Избранные папки", videos: "Избранные видео", photos: "Избранные фото",
+    ...labels,
+  };
+
   if (folders.length) {
     const sec = document.createElement("div");
-    sec.innerHTML = `<div class="fav-section-title">★ Избранные папки <span class="count">(${folders.length})</span></div>`;
+    sec.innerHTML = `<div class="fav-section-title">${l.icon} ${l.folders} <span class="count">(${folders.length})</span></div>`;
     const grid = document.createElement("div");
     grid.className = "folders-grid";
     folders.forEach(f => grid.appendChild(buildCard(f)));
@@ -915,7 +927,7 @@ function renderFavAll(folders, files, content) {
 
   if (videoFiles.length) {
     const sec = document.createElement("div");
-    sec.innerHTML = `<div class="fav-section-title">★ Избранные видео <span class="count">(${videoFiles.length})</span></div>`;
+    sec.innerHTML = `<div class="fav-section-title">${l.icon} ${l.videos} <span class="count">(${videoFiles.length})</span></div>`;
     const grid = document.createElement("div");
     grid.className = "videos-grid";
     videoFiles.forEach(file => grid.appendChild(buildVideoCard(fileToVideo(file), fileToFolder(file))));
@@ -925,8 +937,8 @@ function renderFavAll(folders, files, content) {
 
   if (imageFiles.length) {
     const sec = document.createElement("div");
-    sec.innerHTML = `<div class="fav-section-title">★ Избранные фото <span class="count">(${imageFiles.length})</span></div>`;
-    const synth = makeSynthFolder("Избранные фото", imageFiles);
+    sec.innerHTML = `<div class="fav-section-title">${l.icon} ${l.photos} <span class="count">(${imageFiles.length})</span></div>`;
+    const synth = makeSynthFolder(l.photos, imageFiles);
     const wrap = document.createElement("div");
     wrap.className = "photos-only-container";
     renderPhotosMode([synth], wrap);
@@ -935,7 +947,7 @@ function renderFavAll(folders, files, content) {
   }
 }
 
-// ── Favorites: Videos mode ──────────────────────────────────────────────────
+// ── Tag collection: Videos mode ─────────────────────────────────────────────
 function renderFavVideos(folders, files, content) {
   const grid = document.createElement("div");
   grid.className = "videos-grid";
@@ -948,10 +960,10 @@ function renderFavVideos(folders, files, content) {
   content.appendChild(grid);
 }
 
-// ── Favorites: Photos mode ──────────────────────────────────────────────────
-function renderFavPhotos(folders, files, content) {
+// ── Tag collection: Photos mode ─────────────────────────────────────────────
+function renderFavPhotos(folders, files, content, photosLabel = "Избранные фото") {
   const allFolders = [...folders];
-  if (files.length) allFolders.push(makeSynthFolder("Избранные фото", files));
+  if (files.length) allFolders.push(makeSynthFolder(photosLabel, files));
   renderPhotosMode(allFolders, content);
 }
 
@@ -986,6 +998,74 @@ function makeSynthFolder(name, imageFiles) {
     images_hidden: 0,
     texts: [],
   };
+}
+
+/* ── Wallpapers page ───────────────────────────────────────────────────────── */
+async function loadWallpapers() {
+  document.getElementById("wallpaper-area").classList.remove("hidden");
+  document.getElementById("content-area").classList.add("hidden");
+
+  const content = document.getElementById("wp-content");
+  content.innerHTML = `<div class="loading"><div class="spinner"></div><p>Загрузка обоев...</p></div>`;
+
+  try {
+    renderWallpapers(await api(wpUrl()));
+  } catch (e) {
+    content.innerHTML = `<div class="empty-state"><p>Ошибка: ${e.message}</p></div>`;
+  }
+}
+
+function renderWallpapers(data) {
+  const content = document.getElementById("wp-content");
+  content.innerHTML = "";
+  state.galleryItems = [];
+
+  const mf = state.wpMediaFilter;
+  let folders = data.wallpaper_folders;
+  let files   = data.wallpaper_files;
+
+  if (mf === "videos") { folders = folders.filter(f => f.videos?.length); files = files.filter(f => f.type === "video"); }
+  if (mf === "photos") { folders = folders.filter(f => f.images?.length); files = files.filter(f => f.type === "image"); }
+
+  const rawTotal = data.total_folders + data.total_files;
+  document.getElementById("wp-count").textContent =
+    `${data.total_folders} папок · ${data.total_files} файлов`;
+  const badge = document.getElementById("wp-badge");
+  badge.textContent = rawTotal;
+  badge.classList.toggle("hidden", rawTotal === 0);
+
+  document.getElementById("wp-photo-controls").classList.toggle("hidden", mf !== "photos");
+
+  if (!rawTotal) {
+    content.innerHTML = `
+      <div class="empty-state" style="height:300px">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="3" y="3" width="18" height="18" rx="2"/>
+          <circle cx="8.5" cy="8.5" r="1.5"/>
+          <path d="M21 15l-5-5L5 21"/>
+        </svg>
+        <p>Нет файлов/папок с пометкой _wallpaper</p>
+        <p style="font-size:12px;color:var(--text-mute)">Добавьте _wallpaper к имени файла или папки</p>
+      </div>`;
+    return;
+  }
+
+  if (!folders.length && !files.length) {
+    content.innerHTML = `<div class="empty-state" style="height:200px"><p>Нет результатов для выбранного фильтра</p></div>`;
+    return;
+  }
+
+  if (mf === "videos") {
+    renderFavVideos(folders, files, content);
+  } else if (mf === "photos") {
+    renderFavPhotos(folders, files, content, "Обои");
+  } else {
+    renderFavAll(folders, files, content, {
+      icon: "🖼", folders: "Папки с обоями", videos: "Видео-обои", photos: "Обои",
+    });
+  }
+
+  setupLazyLoad();
 }
 
 /* ── Modal ─────────────────────────────────────────────────────────────────── */
@@ -1054,8 +1134,12 @@ function switchPage(page) {
     btn.classList.toggle("active", btn.dataset.tab === page)
   );
   const isBrowse = page === "browse";
+  const isFav    = page === "favorites";
+  const isWp     = page === "wallpapers";
   document.getElementById("content-area").classList.toggle("hidden", !isBrowse);
-  document.getElementById("fav-area").classList.toggle("hidden", isBrowse);
+  document.getElementById("toolbar").classList.toggle("hidden", !isBrowse);
+  document.getElementById("fav-area").classList.toggle("hidden", !isFav);
+  document.getElementById("wallpaper-area").classList.toggle("hidden", !isWp);
   document.getElementById("best-section")?.classList.toggle("hidden", !isBrowse);
   load();
 }
@@ -1130,8 +1214,9 @@ document.addEventListener("DOMContentLoaded", () => {
   // Photo size buttons
   document.querySelectorAll(".size-btn").forEach(btn => {
     btn.addEventListener("click", () => {
-      document.querySelectorAll(".size-btn").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
+      document.querySelectorAll(".size-btn, .fav-size-btn, .wp-size-btn").forEach(b => b.classList.remove("active"));
+      document.querySelectorAll(`.size-btn[data-size="${btn.dataset.size}"], .fav-size-btn[data-size="${btn.dataset.size}"], .wp-size-btn[data-size="${btn.dataset.size}"]`)
+        .forEach(b => b.classList.add("active"));
       state.photoSize = btn.dataset.size;
       // Re-apply size class to all grids without full reload
       document.querySelectorAll(".photos-large-grid").forEach(grid => {
@@ -1146,8 +1231,14 @@ document.addEventListener("DOMContentLoaded", () => {
   const ratioLabel = document.getElementById("ratio-label");
   ratioBtn.addEventListener("click", () => {
     state.naturalRatio = !state.naturalRatio;
-    ratioBtn.classList.toggle("active", state.naturalRatio);
-    ratioLabel.textContent = state.naturalRatio ? "Авто" : "1:1";
+    const label = state.naturalRatio ? "Авто" : "1:1";
+    ["ratio-btn", "fav-ratio-btn", "wp-ratio-btn"].forEach(id =>
+      document.getElementById(id)?.classList.toggle("active", state.naturalRatio)
+    );
+    ["ratio-label", "fav-ratio-label", "wp-ratio-label"].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = label;
+    });
     document.querySelectorAll(".photos-large-grid").forEach(grid => {
       grid.classList.toggle("natural-ratio-grid", state.naturalRatio);
     });
@@ -1159,8 +1250,9 @@ document.addEventListener("DOMContentLoaded", () => {
   const showTextsBtn   = document.getElementById("show-texts-btn");
   showTextsBtn.addEventListener("click", () => {
     state.showTexts = !state.showTexts;
-    showTextsBtn.classList.toggle("active", state.showTexts);
-    // Instantly show/hide all text wraps without reload
+    ["show-texts-btn", "fav-show-texts-btn", "wp-show-texts-btn"].forEach(id =>
+      document.getElementById(id)?.classList.toggle("active", state.showTexts)
+    );
     document.querySelectorAll(".photo-texts-wrap").forEach(w => {
       w.classList.toggle("hidden", !state.showTexts);
     });
@@ -1249,11 +1341,20 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  // Favorites photo size buttons (share state.photoSize with browse)
-  document.querySelectorAll(".fav-size-btn").forEach(btn => {
+  // Wallpapers media filter (all / videos / photos)
+  document.querySelectorAll("[data-wp-filter]").forEach(btn => {
     btn.addEventListener("click", () => {
-      document.querySelectorAll(".fav-size-btn").forEach(b => b.classList.remove("active"));
-      // Also sync browse size buttons
+      document.querySelectorAll("[data-wp-filter]").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      state.wpMediaFilter = btn.dataset.wpFilter;
+      loadWallpapers();
+    });
+  });
+
+  // Photo size buttons across all pages (share state.photoSize)
+  document.querySelectorAll(".fav-size-btn, .wp-size-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".fav-size-btn, .wp-size-btn").forEach(b => b.classList.remove("active"));
       document.querySelectorAll(".size-btn").forEach(b =>
         b.classList.toggle("active", b.dataset.size === btn.dataset.size)
       );
@@ -1265,32 +1366,39 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  // Fav ratio toggle (shares state.naturalRatio)
-  const favRatioBtn   = document.getElementById("fav-ratio-btn");
-  const favRatioLabel = document.getElementById("fav-ratio-label");
-  favRatioBtn.addEventListener("click", () => {
+  // Ratio toggle across all pages (shares state.naturalRatio)
+  function toggleRatio() {
     state.naturalRatio = !state.naturalRatio;
-    favRatioBtn.classList.toggle("active", state.naturalRatio);
-    document.getElementById("ratio-btn").classList.toggle("active", state.naturalRatio);
-    favRatioLabel.textContent = state.naturalRatio ? "Авто" : "1:1";
-    document.getElementById("ratio-label").textContent = favRatioLabel.textContent;
+    const label = state.naturalRatio ? "Авто" : "1:1";
+    ["ratio-btn", "fav-ratio-btn", "wp-ratio-btn"].forEach(id =>
+      document.getElementById(id)?.classList.toggle("active", state.naturalRatio)
+    );
+    ["ratio-label", "fav-ratio-label", "wp-ratio-label"].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = label;
+    });
     document.querySelectorAll(".photos-large-grid").forEach(g =>
       g.classList.toggle("natural-ratio-grid", state.naturalRatio)
     );
     document.querySelectorAll(".photo-large-cell").forEach(c =>
       c.classList.toggle("natural-ratio", state.naturalRatio)
     );
-  });
+  }
+  document.getElementById("fav-ratio-btn").addEventListener("click", toggleRatio);
+  document.getElementById("wp-ratio-btn").addEventListener("click", toggleRatio);
 
-  // Fav texts toggle (shares state.showTexts)
-  document.getElementById("fav-show-texts-btn").addEventListener("click", () => {
+  // Texts toggle across all pages (shares state.showTexts)
+  function toggleTexts() {
     state.showTexts = !state.showTexts;
-    document.getElementById("fav-show-texts-btn").classList.toggle("active", state.showTexts);
-    document.getElementById("show-texts-btn").classList.toggle("active", state.showTexts);
+    ["show-texts-btn", "fav-show-texts-btn", "wp-show-texts-btn"].forEach(id =>
+      document.getElementById(id)?.classList.toggle("active", state.showTexts)
+    );
     document.querySelectorAll(".photo-texts-wrap").forEach(w =>
       w.classList.toggle("hidden", !state.showTexts)
     );
-  });
+  }
+  document.getElementById("fav-show-texts-btn").addEventListener("click", toggleTexts);
+  document.getElementById("wp-show-texts-btn").addEventListener("click", toggleTexts);
 
   // Modal
   modalClose.addEventListener("click", closeModal);
