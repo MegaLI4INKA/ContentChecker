@@ -106,6 +106,18 @@ body {
   outline: none;
   width: 100%;
 }
+.search-deep {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+  user-select: none;
+}
+.search-deep input { accent-color: var(--accent); cursor: pointer; margin: 0; }
 
 /* ── Buttons ───────────────────────────────────────────────────────────────── */
 .btn-primary {
@@ -579,6 +591,26 @@ body {
   transition: all var(--transition);
 }
 .show-more-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Long listings: the browser skips style/layout/paint of cards far off-screen,
+   so appending a page stays cheap even with thousands of cards above it
+   (measured: ~480 → ~185 ms per page at 80k images). "auto" makes each card
+   remember its real height once rendered; the number is only the first guess. */
+.folder-card        { content-visibility: auto; contain-intrinsic-size: auto 600px; }
+.video-card         { content-visibility: auto; contain-intrinsic-size: auto 260px; }
+.photo-folder-block { content-visibility: auto; contain-intrinsic-size: auto 700px; }
+
+/* Modal: a video format the browser can't play */
+.modal-unsupported {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 48px 24px; text-align: center; color: var(--text-dim); font-size: 14px;
+}
+.modal-unsupported p { margin: 0; }
+
+/* Paging of folder cards (browse tab) */
+.load-more { display: flex; justify-content: center; padding: 20px 0 8px; }
+.load-more .show-more-btn { aspect-ratio: unset; padding: 10px 28px; font-size: 13px; }
+.load-more .show-more-btn:disabled { cursor: default; opacity: .7; }
 
 /* Text content */
 .text-block {
@@ -1205,8 +1237,9 @@ body {
   pointer-events: none;
 }
 
-/* ── Favorites page ────────────────────────────────────────────────────────── */
-#fav-area {
+/* ── Favorites & Wallpapers pages ──────────────────────────────────────────── */
+#fav-area,
+#wallpaper-area {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -1240,10 +1273,15 @@ body {
 .fav-level-btn:hover { border-color: #f0c040; color: #f0c040; }
 .fav-level-btn.active { background: rgba(240,192,64,.12); border-color: #f0c040; color: #f0c040; }
 
-#fav-content {
+/* The wallpapers tab had no rules here, so a long list was cut off without a
+   scrollbar. Both tabs: a scrolling container, the list, then the sentinel. */
+#fav-content,
+#wp-content {
   flex: 1;
   overflow-y: auto;
   padding: 16px;
+}
+.tag-list {
   display: flex;
   flex-direction: column;
   gap: 24px;

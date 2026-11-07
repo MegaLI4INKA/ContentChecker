@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Video-frame thumbnail cache: generated on demand, can grow to hundreds of MB
+.thumbnails/
+
+# macOS
+.DS_Store
+._*
+
+# JetBrains: machine-specific interpreter settings (the rest of .idea stays tracked)
+.idea/misc.xml

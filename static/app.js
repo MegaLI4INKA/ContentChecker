@@ -4,6 +4,7 @@ const state = {
   path: "",
   flat: false,
   search: "",        // filename search
+  searchDeep: localStorage.getItem("cc_search_deep") === "1",  // search the whole subtree
   searchFolder: "",  // folder name search
   categories: new Set(),
   bestFolder: 0,
@@ -24,9 +25,18 @@ const state = {
 /* ── API helpers ───────────────────────────────────────────────────────────── */
 async function api(url) {
   const r = await fetch(url);
-  if (!r.ok) throw new Error(await r.text());
+  if (!r.ok) {
+    let msg = `${r.status} ${r.statusText}`;
+    try { msg = (await r.json()).detail || msg; } catch (_) {}
+    throw new Error(msg);
+  }
   return r.json();
 }
+
+// Each load bumps the counter; a response that arrives after a newer load
+// started is stale (e.g. slow search for "ab" finishing after "abc") and is dropped.
+let loadSeq = 0;
+let searchSeq = 0;
 
 function browseUrl() {
   const p = new URLSearchParams({
@@ -34,6 +44,7 @@ function browseUrl() {
     path: state.path,
     flat: state.flat,
     search: state.search,
+    search_deep: state.searchDeep,
     search_folder: state.searchFolder,
     categories: [...state.categories].join(","),
     min_folder_best: state.bestFolder,
@@ -43,12 +54,13 @@ function browseUrl() {
   return "/api/browse?" + p;
 }
 
-function favUrl(minLevel = 1) {
-  return `/api/favorites?root=${encodeURIComponent(state.root)}&min_level=${minLevel}`;
+function imageThumbUrl(path) {
+  return `/api/thumb?src=${encodeURIComponent(path)}`;
 }
 
-function wpUrl() {
-  return `/api/wallpapers?root=${encodeURIComponent(state.root)}`;
+// Generates (or finds) a cached video frame; the server derives its position from idx
+function genThumbUrl(videoPath, idx) {
+  return `/api/gen-thumb?src=${encodeURIComponent(videoPath)}&idx=${idx}&kind=video`;
 }
 
 function categoriesUrl() {
@@ -59,32 +71,179 @@ function categoriesUrl() {
 async function load() {
   if (!state.root) return;
   localStorage.setItem("cc_root", state.root);
-  if (state.page === "favorites") {
-    await loadFavorites();
-  } else if (state.page === "wallpapers") {
-    await loadWallpapers();
+  if (state.page === "favorites" || state.page === "wallpapers") {
+    await loadTagView(state.page);
   } else {
     await loadBrowse();
   }
 }
 
+/* ── Paging ────────────────────────────────────────────────────────────────── */
+// Listings come page by page (server: offset → next_offset). Each tab has a
+// pager: start(url) begins a new listing (an older one's in-flight page is then
+// dropped), accept(data) renders a page, next() runs when the tab's sentinel
+// scrolls into view or its "Загрузить ещё" button is clicked.
+class Pager {
+  constructor({ page, sentinel, scrollRoot, onPage }) {
+    this.page = page;
+    this.sentinel = document.getElementById(sentinel);
+    this.button = this.sentinel.querySelector("button");
+    this.onPage = onPage;
+    this.gen = 0;
+    this.start(null);
+    this.button.addEventListener("click", () => this.next());
+    // The tab's scrolling element must be the root: with the viewport as root
+    // the margin would not extend into it. Loads a bit before the end.
+    this.observer = new IntersectionObserver(entries => {
+      if (entries.some(e => e.isIntersecting)) this.next();
+    }, { root: document.getElementById(scrollRoot), rootMargin: "0px 0px 1200px 0px" });
+  }
+
+  get more() { return this.nextOffset != null; }
+
+  start(url) {
+    this.gen++;
+    Object.assign(this, { url, nextOffset: null, loading: false, error: false });
+    this.update();
+  }
+
+  accept(data) {
+    this.nextOffset = data.next_offset;
+    this.onPage(data);
+    this.update();
+  }
+
+  async next() {
+    if (this.loading || !this.more || state.page !== this.page) return;
+    const gen = this.gen;
+    this.loading = true;
+    this.error = false;
+    this.update();
+    try {
+      const data = await api(`${this.url}&offset=${this.nextOffset}`);
+      if (gen !== this.gen) return;
+      this.loading = false;
+      this.accept(data);
+    } catch (e) {
+      if (gen !== this.gen) return;
+      this.loading = false;
+      this.error = true;  // no auto-retry loop: the button retries
+      this.update();
+      console.error(e);
+    }
+  }
+
+  update() {
+    this.sentinel.classList.toggle("hidden", !this.more);
+    this.button.disabled = this.loading;
+    this.button.textContent = this.loading ? "Загрузка…"
+                            : this.error   ? "Ошибка загрузки — повторить"
+                            : "Загрузить ещё";
+    // Re-observing fires the callback again if the sentinel is still in view
+    // (page shorter than the screen) — that's what loads the following page.
+    if (this.observer && this.more && !this.loading && !this.error) {
+      this.observer.unobserve(this.sentinel);
+      this.observer.observe(this.sentinel);
+    }
+  }
+}
+
+const pagers = {};  // browse / favorites / wallpapers, created on DOMContentLoaded
+
+function addEl(parent, tag, className) {
+  const el = document.createElement(tag);
+  el.className = className;
+  parent.appendChild(el);
+  return el;
+}
+
 /* ── Browse ────────────────────────────────────────────────────────────────── */
+// Categories depend only on root+path, not on filters or search, and listing them
+// walks the whole subtree — so they are refetched only when root/path changes
+// (or the user presses "Открыть" again).
+const catsCache = { key: null, list: [] };
+
+async function fetchCategories() {
+  const key = `${state.root}\n${state.path}`;
+  if (catsCache.key !== key) {
+    const res = await api(categoriesUrl());
+    catsCache.key = key;
+    catsCache.list = res.categories;
+  }
+  return catsCache.list;
+}
+
+// The folder listing is paged: the first page comes with the sidebar data, the
+// next ones through pagers.browse. All pages of one listing use the same URL
+// (filters frozen at the first page) + offset.
+const browseView = { folders: 0, files: 0, candidates: 0 };
+
 async function loadBrowse() {
+  const seq = ++loadSeq;
+  const url = browseUrl();
+  pagers.browse.start(url);
+  Object.assign(browseView, { folders: 0, files: 0, candidates: 0 });
   showContent("loading");
   try {
-    const [data, cats] = await Promise.all([api(browseUrl()), api(categoriesUrl())]);
-    renderSidebar(data, cats.categories);
-    renderContent(data);
+    const [data, categories] = await Promise.all([api(url), fetchCategories()]);
+    if (seq !== loadSeq) return;
+    renderSidebar(data, categories);
+    document.getElementById("folders-container").innerHTML = "";
+    state.galleryItems = [];
+    setupLazyLoad(true);
+    showContent("folders-container");
+    pagers.browse.accept(data);
   } catch (e) {
-    showContent("empty-state");
+    if (seq !== loadSeq) return;
+    showEmpty(`Ошибка: ${e.message}`);
     console.error(e);
   }
+}
+
+// One page of folders, appended below the cards already shown. A first page
+// may be empty but still have more (the server hit its time budget while
+// searching) — then the sentinel keeps loading until results show up.
+function appendBrowsePage(data) {
+  const container = document.getElementById("folders-container");
+  // "+N ещё" in these cards must apply the same file filters as the listing
+  const filesQuery = `&min_file_best=${state.bestFile}&search=${encodeURIComponent(state.search)}`;
+  data.folders.forEach(f => { f.filesQuery = filesQuery; });
+
+  if (state.mediaFilter === "videos") {
+    renderVideosMode(data.folders, container);
+  } else if (state.mediaFilter === "photos") {
+    renderPhotosMode(data.folders, container);
+  } else {
+    renderAllMode(data.folders, container);
+  }
+
+  browseView.candidates = data.candidates;
+  browseView.folders += data.folders.length;
+  browseView.files += data.folders.reduce((s, f) => s + f.total_videos + f.total_images, 0);
+
+  if (!pagers.browse.more && browseView.folders === 0) { showEmpty(); return; }
+  updateResultCount();
+  setupLazyLoad();
+}
+
+function updateResultCount() {
+  // candidates = folders left after name-only filters; content filters can drop more
+  const of = pagers.browse.more ? ` из ~${browseView.candidates}` : "";
+  document.getElementById("result-count").textContent =
+    `${browseView.folders}${of} папок · ${browseView.files} файлов`;
+}
+
+function showEmpty(message = "Ничего не найдено") {
+  document.querySelector("#empty-state p").textContent = message;
+  showContent("empty-state");
 }
 
 function showContent(id) {
   ["welcome", "loading", "folders-container", "empty-state"].forEach(s =>
     document.getElementById(s).classList.toggle("hidden", s !== id)
   );
+  document.getElementById("load-more").classList.toggle(
+    "hidden", id !== "folders-container" || !pagers.browse?.more);
   // toolbar скрываем только на приветственном экране и во время загрузки
   document.getElementById("toolbar").classList.toggle("hidden", id === "welcome" || id === "loading");
 }
@@ -143,7 +302,10 @@ function renderSidebar(data, categories) {
     catSec.classList.add("hidden");
   } else {
     catSec.classList.remove("hidden");
-    renderCategoryChips(categories, catList);
+    // Keep the chips filtered by what's typed in the category search field —
+    // clicking a chip reloads the sidebar and used to show the full list again
+    const q = fold(catSearch.value.trim());
+    renderCategoryChips(q ? categories.filter(c => fold(c).includes(q)) : categories, catList);
   }
 
   // Show/hide grid-list buttons (only in "all" mode)
@@ -161,8 +323,8 @@ function buildTreeNode(sf, depth) {
   const hasChildren = !!sf.has_children;
 
   // Highlight if matches folder search
-  const searchQ = state.searchFolder.trim().toLowerCase();
-  const isMatch = searchQ && sf.name.toLowerCase().includes(searchQ);
+  const searchQ = fold(state.searchFolder.trim());
+  const isMatch = searchQ && fold(sf.name).includes(searchQ);
 
   const rowClass = [
     "tree-row",
@@ -181,7 +343,7 @@ function buildTreeNode(sf, depth) {
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0">
         <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
       </svg>
-      <span class="tree-name" title="${sf.path}">${sf.name}</span>
+      <span class="tree-name" title="${escapeHtml(sf.path)}">${escapeHtml(sf.name)}</span>
       ${stars ? `<span class="stars tree-stars">${stars}</span>` : ""}
     </div>
     <div class="tree-children hidden"></div>`;
@@ -235,6 +397,7 @@ function buildTreeNode(sf, depth) {
 // ── Search tree (full recursive folder search) ─────────────────────────────
 
 async function renderSearchTree(container) {
+  const seq = ++searchSeq;
   container.innerHTML = `<div class="tree-loading">Поиск...</div>`;
   let res;
   try {
@@ -242,9 +405,10 @@ async function renderSearchTree(container) {
       `/api/search-folders?root=${encodeURIComponent(state.root)}&q=${encodeURIComponent(state.searchFolder)}`
     );
   } catch {
-    container.innerHTML = `<div class="tree-empty">Ошибка поиска</div>`;
+    if (seq === searchSeq) container.innerHTML = `<div class="tree-empty">Ошибка поиска</div>`;
     return;
   }
+  if (seq !== searchSeq) return;
 
   container.innerHTML = "";
   if (!res.results.length) {
@@ -292,7 +456,7 @@ async function renderSearchTree(container) {
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0">
           <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
         </svg>
-        <span class="tree-name">${node.name}</span>
+        <span class="tree-name">${escapeHtml(node.name)}</span>
         ${node.isMatch && node.best_level ? `<span class="stars tree-stars">${starsHtml(node.best_level)}</span>` : ""}
       </div>`;
     el.querySelector(".tree-row").addEventListener("click", () => navigate(node.path));
@@ -339,33 +503,6 @@ function syncStarFilterButtons() {
   });
 }
 
-/* ── Content router ────────────────────────────────────────────────────────── */
-function renderContent(data) {
-  const container = document.getElementById("folders-container");
-  container.innerHTML = "";
-
-  if (!data.folders.length) { showContent("empty-state"); return; }
-
-  state.galleryItems = [];
-
-  if (state.mediaFilter === "videos") {
-    renderVideosMode(data.folders, container);
-  } else if (state.mediaFilter === "photos") {
-    renderPhotosMode(data.folders, container);
-  } else {
-    renderAllMode(data.folders, container);
-  }
-
-  const totalMedia = data.folders.reduce(
-    (s, f) => s + f.total_videos + f.total_images, 0
-  );
-  document.getElementById("result-count").textContent =
-    `${data.total} папок · ${totalMedia} файлов`;
-
-  showContent("folders-container");
-  setupLazyLoad();
-}
-
 /* ── All mode ──────────────────────────────────────────────────────────────── */
 function renderAllMode(folders, container) {
   container.className = "folders-grid" + (state.viewMode === "list" ? " list-mode" : "");
@@ -387,7 +524,7 @@ function buildVideoCard(video, folder) {
   card.className = "video-card";
 
   const bestLevel = video.best_level || 0;
-  const frames    = video.frames;            // [{url, src, idx, pos}, ...]
+  const frames    = video.frames;            // [{url, idx, pos}, ...]
   const frameCount = frames.length;
 
   // Build dots HTML
@@ -397,11 +534,10 @@ function buildVideoCard(video, folder) {
 
   card.innerHTML = `
     <div class="video-card-thumb">
-      <img data-src="${frames[0].url}"
-           data-src-file="${frames[0].src}"
+      <img data-src="${escapeHtml(frames[0].url)}"
+           data-src-file="${escapeHtml(video.path)}"
            data-idx="${frames[0].idx}"
-           data-pos="${frames[0].pos}"
-           data-kind="video" alt="${video.name}">
+           data-kind="video" alt="${escapeHtml(video.name)}">
       <div class="video-card-play">
         <svg width="40" height="40" viewBox="0 0 24 24" fill="rgba(255,255,255,.9)" stroke="none">
           <polygon points="5 3 19 12 5 21"/>
@@ -411,9 +547,9 @@ function buildVideoCard(video, folder) {
       <div class="video-card-dots">${dotsHtml}</div>
     </div>
     <div class="video-card-info">
-      <div class="video-card-name" title="${video.name}">${video.name}</div>
+      <div class="video-card-name" title="${escapeHtml(video.name)}">${escapeHtml(video.name)}</div>
       <div class="video-card-meta">
-        <div class="video-card-folder" title="${folder.path}">📁 ${folder.name}</div>
+        <div class="video-card-folder" title="${escapeHtml(folder.path)}">📁 ${escapeHtml(folder.name)}</div>
         <div class="video-card-actions">
           ${bestLevel > 0 ? `<span class="stars">${starsHtml(bestLevel)}</span>` : ""}
           <button class="card-open-btn" style="padding:3px 8px;font-size:11px" title="Открыть расположение">↗</button>
@@ -457,8 +593,7 @@ function buildVideoCard(video, folder) {
       img.src = cachedUrls[idx];
     } else {
       // Generate on demand
-      const frame = frames[idx];
-      fetch(`/api/gen-thumb?src=${encodeURIComponent(frame.src)}&idx=${frame.idx}&pos=${frame.pos}&kind=video`)
+      fetch(genThumbUrl(video.path, frames[idx].idx))
         .then(r => r.ok ? r.json() : null)
         .then(data => {
           if (data?.url) {
@@ -480,7 +615,7 @@ function buildVideoCard(video, folder) {
       // Kick off generation for remaining frames in background
       frames.slice(1).forEach((frame, i) => {
         const idx = i + 1;
-        fetch(`/api/gen-thumb?src=${encodeURIComponent(frame.src)}&idx=${frame.idx}&pos=${frame.pos}&kind=video`)
+        fetch(genThumbUrl(video.path, frame.idx))
           .then(r => r.ok ? r.json() : null)
           .then(data => { if (data?.url) cachedUrls[idx] = data.url; })
           .catch(() => {});
@@ -504,6 +639,57 @@ function buildVideoCard(video, folder) {
 }
 
 /* ── Photos mode ───────────────────────────────────────────────────────────── */
+function makeLargePhotoCell(imgData) {
+  const iBest = imgData.best_level || 0;
+  const natClass = state.naturalRatio ? " natural-ratio" : "";
+  const cell = document.createElement("div");
+  cell.className = `photo-large-cell${natClass}`;
+  cell.innerHTML = `
+    <img data-src="${escapeHtml(imageThumbUrl(imgData.path))}" data-kind="image" alt="${escapeHtml(imgData.name)}">
+    ${iBest > 0 ? `<span class="file-star">${starsHtml(iBest)}</span>` : ""}
+    <div class="photo-name-overlay">${escapeHtml(imgData.name)}</div>`;
+  const galleryIdx = state.galleryItems.length;
+  state.galleryItems.push({ src: imgData.path, name: imgData.name, type: "image" });
+  cell.addEventListener("click", () => openModal("image", imgData.path, imgData.name, galleryIdx));
+  return cell;
+}
+
+// "+N ещё": a card comes with its first photos only; the rest are fetched from
+// the server in batches, with the file filters of the listing the card came
+// from (folder.filesQuery). A huge folder no longer arrives in one piece.
+const SHOW_MORE_BATCH = 240;
+
+function addShowMore(folder, grid, makeCell, cellClass, style = "") {
+  let shown = folder.images.length;
+  if (folder.synthetic || folder.total_images <= shown) return;
+  const more = document.createElement("div");
+  more.className = `show-more-btn ${cellClass}`;
+  more.style.cssText = style;
+  const label = () => { more.textContent = `+${folder.total_images - shown} ещё`; };
+  label();
+  let busy = false;
+  more.addEventListener("click", async () => {
+    if (busy) return;
+    busy = true;
+    more.textContent = "Загрузка…";
+    try {
+      const res = await api(`/api/folder-images?path=${encodeURIComponent(folder.path)}` +
+                            `&offset=${shown}&limit=${SHOW_MORE_BATCH}${folder.filesQuery || ""}`);
+      res.images.forEach(img => grid.insertBefore(makeCell(img), more));
+      shown += res.images.length;
+      folder.total_images = res.total;  // the folder may have changed since the listing
+      if (!res.images.length || shown >= res.total) more.remove(); else label();
+      setupLazyLoad();
+    } catch (e) {
+      more.textContent = "Ошибка — повторить";
+      console.error(e);
+    } finally {
+      busy = false;
+    }
+  });
+  grid.appendChild(more);
+}
+
 function renderPhotosMode(folders, container) {
   container.className = "photos-only-container";
 
@@ -518,10 +704,10 @@ function renderPhotosMode(folders, container) {
       <div class="photo-folder-block-header">
         <div>
           <div class="photo-folder-block-name">
-            📁 ${folder.name}
+            📁 ${escapeHtml(folder.name)}
             ${bestLevel > 0 ? `<span class="stars" style="margin-left:6px">${starsHtml(bestLevel)}</span>` : ""}
           </div>
-          <div class="photo-folder-block-path">${folder.path}</div>
+          <div class="photo-folder-block-path">${escapeHtml(folder.path)}</div>
         </div>
         <div class="photo-folder-block-meta">
           <span class="card-badge badge-photo">◼ ${folder.total_images} фото</span>
@@ -538,37 +724,9 @@ function renderPhotosMode(folders, container) {
     const grid = block.querySelector(".photos-large-grid");
     grid.className = `photos-large-grid size-${state.photoSize}${state.naturalRatio ? " natural-ratio-grid" : ""}`;
 
-    const images = folder.images || [];
-    const makePhotoCell = (imgData) => {
-      const iBest = imgData.best_level || 0;
-      const natClass = state.naturalRatio ? " natural-ratio" : "";
-      const cell = document.createElement("div");
-      cell.className = `photo-large-cell${natClass}`;
-      cell.innerHTML = `
-        <img data-src="${imgData.url}" data-src-file="${imgData.src}" data-kind="image" alt="${imgData.name}">
-        ${iBest > 0 ? `<span class="file-star">${starsHtml(iBest)}</span>` : ""}
-        <div class="photo-name-overlay">${imgData.name}</div>`;
-      const galleryIdx = state.galleryItems.length;
-      state.galleryItems.push({ src: imgData.path, name: imgData.name, type: "image" });
-      cell.addEventListener("click", () => openModal("image", imgData.path, imgData.name, galleryIdx));
-      return cell;
-    };
-
-    images.forEach(img => grid.appendChild(makePhotoCell(img)));
-
-    // Show more
-    if (folder.images_hidden > 0) {
-      const more = document.createElement("div");
-      more.className = "show-more-btn photo-large-cell";
-      more.style.cssText = "font-size:14px;aspect-ratio:unset;height:60px";
-      more.textContent = `+${folder.images_hidden} ещё`;
-      more.addEventListener("click", () => {
-        more.remove();
-        folder.images.slice(24).forEach(imgData => grid.appendChild(makePhotoCell(imgData)));
-        setupLazyLoad();
-      });
-      grid.appendChild(more);
-    }
+    folder.images.forEach(img => grid.appendChild(makeLargePhotoCell(img)));
+    addShowMore(folder, grid, makeLargePhotoCell, "photo-large-cell",
+                "font-size:14px;aspect-ratio:unset;height:60px");
 
     // Text files below the photo grid
     if (folder.texts && folder.texts.length) {
@@ -584,7 +742,7 @@ function renderPhotosMode(folders, container) {
                 <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
                 <polyline points="14 2 14 8 20 8"/>
               </svg>
-              ${txt.name}
+              ${escapeHtml(txt.name)}
             </span>
             <span class="text-block-toggle">▾</span>
           </div>
@@ -625,8 +783,8 @@ function buildCard(folder) {
   card.innerHTML = `
     <div class="card-header">
       <div class="card-header-info">
-        <div class="card-folder-name" title="${folder.path}">📁 ${folder.name}</div>
-        <div class="card-folder-path">${folder.path}</div>
+        <div class="card-folder-name" title="${escapeHtml(folder.path)}">📁 ${escapeHtml(folder.name)}</div>
+        <div class="card-folder-path">${escapeHtml(folder.path)}</div>
         <div class="card-meta">${badges}</div>
       </div>
       <div class="card-header-actions">
@@ -636,7 +794,7 @@ function buildCard(folder) {
           </svg>
           В папку
         </button>
-        <button class="card-open-btn" data-path="${folder.path}" title="Открыть в Finder/Explorer">
+        <button class="card-open-btn" title="Открыть в Finder/Explorer">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
             <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
@@ -662,16 +820,20 @@ function buildCard(folder) {
     sec.className = "card-section";
     sec.innerHTML = `
       <div class="card-section-label">
-        🎬 <span class="filename">${video.name}</span>
+        🎬 <span class="filename">${escapeHtml(video.name)}</span>
         ${vBest > 0 ? `<span class="stars" style="margin-left:4px">${starsHtml(vBest)}</span>` : ""}
         <button class="card-open-btn" style="margin-left:auto;padding:3px 8px;font-size:10.5px"
-                data-path="${video.path}" title="Открыть файл">↗</button>
+                title="Открыть файл">↗</button>
       </div>
       <div class="frames-strip"></div>`;
 
-    sec.querySelector("[data-path]").addEventListener("click", e => {
+    sec.querySelector(".card-open-btn").addEventListener("click", e => {
       e.stopPropagation(); openLocation(video.path);
     });
+
+    // One gallery entry per video: every frame opens the same item
+    const galleryIdx = state.galleryItems.length;
+    state.galleryItems.push({ src: video.path, name: video.name, type: "video" });
 
     const strip = sec.querySelector(".frames-strip");
     video.frames.forEach(frame => {
@@ -686,62 +848,39 @@ function buildCard(folder) {
         <div class="thumb-play">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="white" stroke="none"><polygon points="5 3 19 12 5 21"/></svg>
         </div>
-        <img data-src="${frame.url}" data-src-file="${frame.src}"
-             data-idx="${frame.idx}" data-pos="${frame.pos}" data-kind="video" alt="">`;
+        <img data-src="${escapeHtml(frame.url)}" data-src-file="${escapeHtml(video.path)}"
+             data-idx="${frame.idx}" data-kind="video" alt="">`;
 
-      const idx = state.galleryItems.length;
-      state.galleryItems.push({ src: video.path, name: video.name, type: "video" });
-      cell.addEventListener("click", () => openModal("video", video.path, video.name, idx));
+      cell.addEventListener("click", () => openModal("video", video.path, video.name, galleryIdx));
       strip.appendChild(cell);
     });
 
     card.appendChild(sec);
   });
 
-  // Photos
-  if (folder.images_preview?.length) {
+  // Photos (the first ones; "+N ещё" fetches the rest)
+  if (folder.images.length) {
     const sec = document.createElement("div");
     sec.className = "card-section";
     sec.innerHTML = `<div class="card-section-label">🖼 Фотографии</div><div class="photos-grid"></div>`;
     const grid = sec.querySelector(".photos-grid");
 
-    folder.images_preview.forEach(img => {
+    const makePhotoCell = img => {
       const iBest = img.best_level || 0;
       const cell = document.createElement("div");
       cell.className = "photo-cell";
       cell.style.position = "relative";
       cell.innerHTML = `
-        <img data-src="${img.url}" data-src-file="${img.src}" data-kind="image" alt="${img.name}">
+        <img data-src="${escapeHtml(imageThumbUrl(img.path))}" data-kind="image" alt="${escapeHtml(img.name)}">
         ${iBest > 0 ? `<span class="file-star">${starsHtml(iBest)}</span>` : ""}`;
       const idx = state.galleryItems.length;
       state.galleryItems.push({ src: img.path, name: img.name, type: "image" });
       cell.addEventListener("click", () => openModal("image", img.path, img.name, idx));
-      grid.appendChild(cell);
-    });
+      return cell;
+    };
 
-    if (folder.images_hidden > 0) {
-      const more = document.createElement("div");
-      more.className = "show-more-btn photo-cell";
-      more.textContent = `+${folder.images_hidden} ещё`;
-      more.addEventListener("click", () => {
-        more.remove();
-        folder.images.slice(24).forEach(imgData => {
-          const iBest = imgData.best_level || 0;
-          const cell = document.createElement("div");
-          cell.className = "photo-cell";
-          cell.style.position = "relative";
-          cell.innerHTML = `
-            <img data-src="${imgData.url}" data-src-file="${imgData.src}" data-kind="image" alt="${imgData.name}">
-            ${iBest > 0 ? `<span class="file-star">${starsHtml(iBest)}</span>` : ""}`;
-          const idx = state.galleryItems.length;
-          state.galleryItems.push({ src: imgData.path, name: imgData.name, type: "image" });
-          cell.addEventListener("click", () => openModal("image", imgData.path, imgData.name, idx));
-          grid.appendChild(cell);
-        });
-        setupLazyLoad();
-      });
-      grid.appendChild(more);
-    }
+    folder.images.forEach(img => grid.appendChild(makePhotoCell(img)));
+    addShowMore(folder, grid, makePhotoCell, "photo-cell");
 
     card.appendChild(sec);
   }
@@ -761,7 +900,7 @@ function buildCard(folder) {
               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
               <polyline points="14 2 14 8 20 8"/>
             </svg>
-            ${txt.name}
+            ${escapeHtml(txt.name)}
           </span>
           <span class="text-block-toggle">▾</span>
         </div>
@@ -780,18 +919,27 @@ function buildCard(folder) {
 /* ── Lazy thumbnail loading ────────────────────────────────────────────────── */
 let observer = null;
 
-function setupLazyLoad() {
-  if (observer) observer.disconnect();
-  observer = new IntersectionObserver(entries => {
-    entries.forEach(entry => {
-      if (!entry.isIntersecting) return;
-      const img = entry.target;
-      observer.unobserve(img);
-      loadThumb(img);
-    });
-  }, { rootMargin: "150px" });
-
-  document.querySelectorAll("img[data-src]").forEach(img => observer.observe(img));
+// Starts watching images added since the last call. reset=true after the content
+// was replaced wholesale (drops the old, now detached, images). Appending a page
+// or "+N ещё" must not reset: re-observing every image on each page made paging
+// quadratic, and re-loading visible ones re-requested frames.
+function setupLazyLoad(reset = false) {
+  if (reset || !observer) {
+    observer?.disconnect();
+    observer = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (!entry.isIntersecting) return;
+        const img = entry.target;
+        observer.unobserve(img);
+        img.dataset.lazy = "started";
+        loadThumb(img);
+      });
+    }, { rootMargin: "150px" });
+  }
+  document.querySelectorAll("img[data-src]:not([data-lazy])").forEach(img => {
+    img.dataset.lazy = "observed";
+    observer.observe(img);
+  });
 }
 
 function loadThumb(img) {
@@ -817,8 +965,7 @@ function loadThumb(img) {
   };
   test.onerror = async () => {
     try {
-      const genUrl = `/api/gen-thumb?src=${encodeURIComponent(img.dataset.srcFile)}&idx=${img.dataset.idx}&pos=${img.dataset.pos}&kind=video`;
-      const res = await fetch(genUrl);
+      const res = await fetch(genThumbUrl(img.dataset.srcFile, img.dataset.idx));
       if (res.ok) {
         const data = await res.json();
         img.src = data.url;
@@ -830,214 +977,37 @@ function loadThumb(img) {
   test.src = url;
 }
 
-/* ── Favorites page ────────────────────────────────────────────────────────── */
-async function loadFavorites() {
-  document.getElementById("fav-area").classList.remove("hidden");
-  document.getElementById("content-area").classList.add("hidden");
-
-  const minLevel = state.favLevel > 0 ? state.favLevel : 1;
-  const content = document.getElementById("fav-content");
-  content.innerHTML = `<div class="loading"><div class="spinner"></div><p>Загрузка избранного...</p></div>`;
-
-  try {
-    renderFavorites(await api(favUrl(minLevel)));
-  } catch (e) {
-    content.innerHTML = `<div class="empty-state"><p>Ошибка: ${e.message}</p></div>`;
-  }
-}
-
-function renderFavorites(data) {
-  const content = document.getElementById("fav-content");
-  content.innerHTML = "";
-  state.galleryItems = [];
-
-  const mf = state.favMediaFilter;
-
-  // Filter by star level
-  let folders = state.favLevel > 0
-    ? data.favorite_folders.filter(f => f.best_level === state.favLevel)
-    : data.favorite_folders;
-  let files = state.favLevel > 0
-    ? data.favorite_files.filter(f => f.best_level === state.favLevel)
-    : data.favorite_files;
-
-  // Filter by media type
-  if (mf === "videos") { folders = folders.filter(f => f.videos?.length); files = files.filter(f => f.type === "video"); }
-  if (mf === "photos") { folders = folders.filter(f => f.images?.length); files = files.filter(f => f.type === "image"); }
-
-  // Badge counts (use original totals)
-  const rawTotal = data.total_folders + data.total_files;
-  document.getElementById("fav-count").textContent =
-    `${data.total_folders} папок · ${data.total_files} файлов`;
-  const badge = document.getElementById("fav-badge");
-  badge.textContent = rawTotal;
-  badge.classList.toggle("hidden", rawTotal === 0);
-
-  // Show/hide photo controls in fav toolbar
-  document.getElementById("fav-photo-controls").classList.toggle("hidden", mf !== "photos");
-
-  if (!rawTotal) {
-    content.innerHTML = `
+/* ── Favorites & Wallpapers ────────────────────────────────────────────────── */
+// Tagged folders and files, page by page. The server sends all folders first,
+// then videos, then photos, so every page is appended to the section in
+// progress. Star level / media filters are applied by the server; changing them
+// reuses the last tree walk (fresh=0), opening the tab re-walks (fresh=1).
+const TAG_VIEWS = {
+  favorites: {
+    area: "fav-area", list: "fav-list", count: "fav-count", badge: "fav-badge",
+    photoControls: "fav-photo-controls",
+    labels: { icon: "★", folders: "Избранные папки", videos: "Избранные видео", photos: "Избранные фото" },
+    media: () => state.favMediaFilter,
+    url: () => `/api/favorites?root=${encodeURIComponent(state.root)}` +
+               `&level=${state.favLevel}&media=${state.favMediaFilter}`,
+    loadingText: "Загрузка избранного...",
+    emptyHtml: `
       <div class="empty-state" style="height:300px">
         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
           <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
         </svg>
         <p>Нет файлов/папок с пометкой _best</p>
         <p style="font-size:12px;color:var(--text-mute)">Добавьте суффикс _best к именам файлов или папок</p>
-      </div>`;
-    return;
-  }
-
-  if (!folders.length && !files.length) {
-    content.innerHTML = `<div class="empty-state" style="height:200px"><p>Нет результатов для выбранного фильтра</p></div>`;
-    return;
-  }
-
-  if (mf === "videos") {
-    renderFavVideos(folders, files, content);
-  } else if (mf === "photos") {
-    renderFavPhotos(folders, files, content);
-  } else {
-    renderFavAll(folders, files, content);
-  }
-
-  setupLazyLoad();
-}
-
-// ── Tag collection: All mode (used by Favorites and Wallpapers) ────────────
-function renderFavAll(folders, files, content, labels = {}) {
-  const l = {
-    icon: "★", folders: "Избранные папки", videos: "Избранные видео", photos: "Избранные фото",
-    ...labels,
-  };
-
-  if (folders.length) {
-    const sec = document.createElement("div");
-    sec.innerHTML = `<div class="fav-section-title">${l.icon} ${l.folders} <span class="count">(${folders.length})</span></div>`;
-    const grid = document.createElement("div");
-    grid.className = "folders-grid";
-    folders.forEach(f => grid.appendChild(buildCard(f)));
-    sec.appendChild(grid);
-    content.appendChild(sec);
-  }
-
-  // Split individual files by type and render in appropriate mode
-  const videoFiles = files.filter(f => f.type === "video");
-  const imageFiles = files.filter(f => f.type === "image");
-
-  if (videoFiles.length) {
-    const sec = document.createElement("div");
-    sec.innerHTML = `<div class="fav-section-title">${l.icon} ${l.videos} <span class="count">(${videoFiles.length})</span></div>`;
-    const grid = document.createElement("div");
-    grid.className = "videos-grid";
-    videoFiles.forEach(file => grid.appendChild(buildVideoCard(fileToVideo(file), fileToFolder(file))));
-    sec.appendChild(grid);
-    content.appendChild(sec);
-  }
-
-  if (imageFiles.length) {
-    const sec = document.createElement("div");
-    sec.innerHTML = `<div class="fav-section-title">${l.icon} ${l.photos} <span class="count">(${imageFiles.length})</span></div>`;
-    const synth = makeSynthFolder(l.photos, imageFiles);
-    const wrap = document.createElement("div");
-    wrap.className = "photos-only-container";
-    renderPhotosMode([synth], wrap);
-    sec.appendChild(wrap);
-    content.appendChild(sec);
-  }
-}
-
-// ── Tag collection: Videos mode ─────────────────────────────────────────────
-function renderFavVideos(folders, files, content) {
-  const grid = document.createElement("div");
-  grid.className = "videos-grid";
-
-  folders.forEach(folder => {
-    (folder.videos || []).forEach(video => grid.appendChild(buildVideoCard(video, folder)));
-  });
-  files.forEach(file => grid.appendChild(buildVideoCard(fileToVideo(file), fileToFolder(file))));
-
-  content.appendChild(grid);
-}
-
-// ── Tag collection: Photos mode ─────────────────────────────────────────────
-function renderFavPhotos(folders, files, content, photosLabel = "Избранные фото") {
-  const allFolders = [...folders];
-  if (files.length) allFolders.push(makeSynthFolder(photosLabel, files));
-  renderPhotosMode(allFolders, content);
-}
-
-// ── Helpers: convert individual fav file to video/folder objects ────────────
-function fileToVideo(file) {
-  return {
-    name: file.name,
-    path: file.path,
-    best_level: file.best_level,
-    frames: [{ url: file.url, src: file.src, idx: file.idx ?? 0, pos: file.pos ?? 0.5 }],
-  };
-}
-
-function fileToFolder(file) {
-  return { name: file.folder_name, path: file.folder_path };
-}
-
-function makeSynthFolder(name, imageFiles) {
-  const images = imageFiles.map(f => ({
-    name: f.name,
-    path: f.path,
-    url: f.url,
-    src: f.src,
-    best_level: f.best_level,
-  }));
-  return {
-    name,
-    path: imageFiles[0]?.folder_path || "",
-    best_level: 0,
-    images,
-    total_images: images.length,
-    images_hidden: 0,
-    texts: [],
-  };
-}
-
-/* ── Wallpapers page ───────────────────────────────────────────────────────── */
-async function loadWallpapers() {
-  document.getElementById("wallpaper-area").classList.remove("hidden");
-  document.getElementById("content-area").classList.add("hidden");
-
-  const content = document.getElementById("wp-content");
-  content.innerHTML = `<div class="loading"><div class="spinner"></div><p>Загрузка обоев...</p></div>`;
-
-  try {
-    renderWallpapers(await api(wpUrl()));
-  } catch (e) {
-    content.innerHTML = `<div class="empty-state"><p>Ошибка: ${e.message}</p></div>`;
-  }
-}
-
-function renderWallpapers(data) {
-  const content = document.getElementById("wp-content");
-  content.innerHTML = "";
-  state.galleryItems = [];
-
-  const mf = state.wpMediaFilter;
-  let folders = data.wallpaper_folders;
-  let files   = data.wallpaper_files;
-
-  if (mf === "videos") { folders = folders.filter(f => f.videos?.length); files = files.filter(f => f.type === "video"); }
-  if (mf === "photos") { folders = folders.filter(f => f.images?.length); files = files.filter(f => f.type === "image"); }
-
-  const rawTotal = data.total_folders + data.total_files;
-  document.getElementById("wp-count").textContent =
-    `${data.total_folders} папок · ${data.total_files} файлов`;
-  const badge = document.getElementById("wp-badge");
-  badge.textContent = rawTotal;
-  badge.classList.toggle("hidden", rawTotal === 0);
-
-  document.getElementById("wp-photo-controls").classList.toggle("hidden", mf !== "photos");
-
-  if (!rawTotal) {
-    content.innerHTML = `
+      </div>`,
+  },
+  wallpapers: {
+    area: "wallpaper-area", list: "wp-list", count: "wp-count", badge: "wp-badge",
+    photoControls: "wp-photo-controls",
+    labels: { icon: "🖼", folders: "Папки с обоями", videos: "Видео-обои", photos: "Обои" },
+    media: () => state.wpMediaFilter,
+    url: () => `/api/wallpapers?root=${encodeURIComponent(state.root)}&media=${state.wpMediaFilter}`,
+    loadingText: "Загрузка обоев...",
+    emptyHtml: `
       <div class="empty-state" style="height:300px">
         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
           <rect x="3" y="3" width="18" height="18" rx="2"/>
@@ -1046,29 +1016,129 @@ function renderWallpapers(data) {
         </svg>
         <p>Нет файлов/папок с пометкой _wallpaper</p>
         <p style="font-size:12px;color:var(--text-mute)">Добавьте _wallpaper к имени файла или папки</p>
-      </div>`;
-    return;
+      </div>`,
+  },
+};
+
+async function loadTagView(name, fresh = true) {
+  const v = TAG_VIEWS[name];
+  document.getElementById(v.area).classList.remove("hidden");
+  document.getElementById("content-area").classList.add("hidden");
+  document.getElementById(v.photoControls).classList.toggle("hidden", v.media() !== "photos");
+
+  const list = document.getElementById(v.list);
+  list.innerHTML = `<div class="loading"><div class="spinner"></div><p>${v.loadingText}</p></div>`;
+  const url = v.url();
+  pagers[name].start(url);
+  const seq = ++loadSeq;
+  try {
+    const data = await api(url + (fresh ? "&fresh=1" : ""));
+    if (seq !== loadSeq) return;
+
+    const badge = document.getElementById(v.badge);
+    badge.textContent = data.total;
+    badge.classList.toggle("hidden", !data.total);
+    const c = data.counts;
+    document.getElementById(v.count).textContent = `${c.folders} папок · ${c.videos + c.photos} файлов`;
+
+    if (!data.total) { list.innerHTML = v.emptyHtml; return; }
+    list.innerHTML = "";
+    state.galleryItems = [];
+    v.ctx = { counts: c, shown: 0 };  // sections are created when their first item arrives
+    setupLazyLoad(true);
+    pagers[name].accept(data);
+  } catch (e) {
+    if (seq === loadSeq) list.innerHTML = `<div class="empty-state"><p>Ошибка: ${escapeHtml(e.message)}</p></div>`;
+  }
+}
+
+function appendTagPage(name, data) {
+  const v = TAG_VIEWS[name];
+  const ctx = v.ctx;
+  const l = v.labels;
+  const list = document.getElementById(v.list);
+  const mf = v.media();
+
+  for (const item of data.items) {
+    ctx.shown++;
+    const isFolder = item.kind === "folder";
+    if (mf === "videos") {
+      const grid = ctx.videoGrid ??= addEl(list, "div", "videos-grid");
+      if (isFolder) item.videos.forEach(video => grid.appendChild(buildVideoCard(video, item)));
+      else grid.appendChild(buildVideoCard(fileToVideo(item), fileToFolder(item)));
+    } else if (mf === "photos") {
+      const wrap = ctx.photoWrap ??= addEl(list, "div", "photos-only-container");
+      if (isFolder) renderPhotosMode([item], wrap);
+      else appendLoosePhoto(ctx, wrap, item, l.photos);
+    } else if (isFolder) {
+      (ctx.folderGrid ??= addSection(list, `${l.icon} ${l.folders}`, ctx.counts.folders, "folders-grid"))
+        .appendChild(buildCard(item));
+    } else if (item.type === "video") {
+      (ctx.videoGrid ??= addSection(list, `${l.icon} ${l.videos}`, ctx.counts.videos, "videos-grid"))
+        .appendChild(buildVideoCard(fileToVideo(item), fileToFolder(item)));
+    } else {
+      const wrap = ctx.photoWrap ??= addSection(list, `${l.icon} ${l.photos}`, ctx.counts.photos, "photos-only-container");
+      appendLoosePhoto(ctx, wrap, item, l.photos);
+    }
   }
 
-  if (!folders.length && !files.length) {
-    content.innerHTML = `<div class="empty-state" style="height:200px"><p>Нет результатов для выбранного фильтра</p></div>`;
-    return;
+  if (!pagers[name].more && ctx.shown === 0) {
+    list.innerHTML = `<div class="empty-state" style="height:200px"><p>Нет результатов для выбранного фильтра</p></div>`;
   }
-
-  if (mf === "videos") {
-    renderFavVideos(folders, files, content);
-  } else if (mf === "photos") {
-    renderFavPhotos(folders, files, content, "Обои");
-  } else {
-    renderFavAll(folders, files, content, {
-      icon: "🖼", folders: "Папки с обоями", videos: "Видео-обои", photos: "Обои",
-    });
-  }
-
   setupLazyLoad();
 }
 
+// Section with a title and a grid; returns the grid
+function addSection(list, title, count, gridClass) {
+  const sec = addEl(list, "div", "");
+  sec.innerHTML = `<div class="fav-section-title">${title} <span class="count">(${count})</span></div>`;
+  return addEl(sec, "div", gridClass);
+}
+
+// Single tagged photos share one block; it's created with the first of them
+function appendLoosePhoto(ctx, wrap, file, label) {
+  if (ctx.looseGrid) {
+    ctx.looseGrid.appendChild(makeLargePhotoCell(file));
+    return;
+  }
+  renderPhotosMode([makeSynthFolder(label, [file], ctx.counts.photos)], wrap);
+  ctx.looseGrid = wrap.lastElementChild.querySelector(".photos-large-grid");
+}
+
+// ── Helpers: convert individual tagged file to video/folder objects ─────────
+function fileToVideo(file) {
+  return {
+    name: file.name,
+    path: file.path,
+    best_level: file.best_level,
+    frames: file.frames,  // one frame, from the server
+  };
+}
+
+function fileToFolder(file) {
+  return { name: file.folder_name, path: file.folder_path };
+}
+
+function makeSynthFolder(name, imageFiles, total = imageFiles.length) {
+  const images = imageFiles.map(f => ({
+    name: f.name,
+    path: f.path,
+    best_level: f.best_level,
+  }));
+  return {
+    name,
+    path: imageFiles[0]?.folder_path || "",
+    best_level: 0,
+    images,
+    total_images: total,
+    synthetic: true,  // photos from different folders: no "+N ещё"
+    texts: [],
+  };
+}
+
 /* ── Modal ─────────────────────────────────────────────────────────────────── */
+const BROWSER_UNSUPPORTED_IMG = /\.(heic|heif|tiff?)$/i;
+
 function openModal(type, src, name, galleryIdx) {
   state.galleryIdx = galleryIdx;
   renderModal(type, src, name);
@@ -1081,6 +1151,7 @@ function renderModal(type, src, name) {
   document.getElementById("modal-open").onclick = () => openLocation(src);
 
   const body = document.getElementById("modal-body");
+  stopModalVideo();
   body.innerHTML = "";
 
   if (type === "video") {
@@ -1088,10 +1159,26 @@ function renderModal(type, src, name) {
     v.src = `/file?path=${encodeURIComponent(src)}`;
     v.controls = true;
     v.autoplay = true;
+    // AVI, WMV, FLV and some MKV can't be played by browsers: say so instead
+    // of leaving an empty player
+    v.addEventListener("error", () => {
+      if (!v.isConnected || !v.getAttribute("src")) return;  // already replaced/stopped
+      const ext = (src.split(".").pop() || "").toUpperCase();
+      body.innerHTML = `
+        <div class="modal-unsupported">
+          <p>Браузер не умеет воспроизводить этот файл (${escapeHtml(ext)}).</p>
+          <p>Откройте его в видеоплеере, например IINA или VLC.</p>
+          <button class="btn-primary">Показать в Finder</button>
+        </div>`;
+      body.querySelector("button").addEventListener("click", () => openLocation(src));
+    });
     body.appendChild(v);
   } else {
     const img = document.createElement("img");
-    img.src = `/file?path=${encodeURIComponent(src)}`;
+    // Browsers (except Safari) can't render HEIC/TIFF — ask the server for a JPEG
+    img.src = BROWSER_UNSUPPORTED_IMG.test(src)
+      ? `/api/thumb?src=${encodeURIComponent(src)}&max=2560`
+      : `/file?path=${encodeURIComponent(src)}`;
     body.appendChild(img);
   }
 
@@ -1114,7 +1201,17 @@ function updateModalNav() {
 function closeModal() {
   document.getElementById("modal").classList.add("hidden");
   document.body.style.overflow = "";
-  document.querySelectorAll("#modal-body video").forEach(v => v.pause());
+  stopModalVideo();
+}
+
+// Pausing alone left the browser downloading the file after the modal was
+// closed or switched to the next item; dropping src stops the transfer.
+function stopModalVideo() {
+  document.querySelectorAll("#modal-body video").forEach(v => {
+    v.pause();
+    v.removeAttribute("src");
+    v.load();
+  });
 }
 
 /* ── Navigation ────────────────────────────────────────────────────────────── */
@@ -1145,10 +1242,18 @@ function switchPage(page) {
 }
 
 /* ── Utils ─────────────────────────────────────────────────────────────────── */
+// Every file/folder name or path inserted via innerHTML must go through this:
+// names come from disk and may contain <, ", & (or a malicious payload).
 function escapeHtml(str) {
-  return str
+  return String(str ?? "")
     .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// Same as fold() on the server: one Unicode form ("й" typed vs "и"+breve in
+// names from macOS disks) and lower case, so name matching works for both
+function fold(s) {
+  return s.normalize("NFC").toLowerCase();
 }
 
 function debounce(fn, ms) {
@@ -1175,6 +1280,7 @@ document.addEventListener("DOMContentLoaded", () => {
     state.root = rootInput.value.trim();
     state.path = "";
     state.categories.clear();
+    catsCache.key = null;  // "Открыть" also works as "refresh from disk"
     load();
   });
   rootInput.addEventListener("keydown", e => { if (e.key === "Enter") loadBtn.click(); });
@@ -1183,6 +1289,16 @@ document.addEventListener("DOMContentLoaded", () => {
     state.search = e.target.value;
     load();
   }, 300));
+
+  // "Во всех подпапках": file search through the whole subtree of the current
+  // folder (otherwise only the folder itself and its direct subfolders)
+  const searchDeep = document.getElementById("search-deep");
+  searchDeep.checked = state.searchDeep;
+  searchDeep.addEventListener("change", () => {
+    state.searchDeep = searchDeep.checked;
+    localStorage.setItem("cc_search_deep", state.searchDeep ? "1" : "0");
+    if (state.search.trim()) load();  // without a query the listing doesn't change
+  });
 
   flatToggle.addEventListener("change", e => { state.flat = e.target.checked; load(); });
 
@@ -1287,11 +1403,11 @@ document.addEventListener("DOMContentLoaded", () => {
   const catSearchClear = document.getElementById("cat-search-clear");
 
   catSearchInput.addEventListener("input", e => {
-    const q = e.target.value.trim().toLowerCase();
+    const q = fold(e.target.value.trim());
     catSearchClear.classList.toggle("hidden", !e.target.value);
     const catList = document.getElementById("categories-list");
     const all = JSON.parse(catList.dataset.allCats || "[]");
-    const filtered = q ? all.filter(c => c.toLowerCase().includes(q)) : all;
+    const filtered = q ? all.filter(c => fold(c).includes(q)) : all;
     renderCategoryChips(filtered, catList);
   });
 
@@ -1327,7 +1443,7 @@ document.addEventListener("DOMContentLoaded", () => {
       document.querySelectorAll(".fav-level-btn").forEach(b => b.classList.remove("active"));
       btn.classList.add("active");
       state.favLevel = parseInt(btn.dataset.exact || "0");
-      loadFavorites();
+      loadTagView("favorites", false);  // filters reuse the last tree walk
     });
   });
 
@@ -1337,7 +1453,7 @@ document.addEventListener("DOMContentLoaded", () => {
       document.querySelectorAll("[data-fav-filter]").forEach(b => b.classList.remove("active"));
       btn.classList.add("active");
       state.favMediaFilter = btn.dataset.favFilter;
-      loadFavorites();
+      loadTagView("favorites", false);
     });
   });
 
@@ -1347,7 +1463,7 @@ document.addEventListener("DOMContentLoaded", () => {
       document.querySelectorAll("[data-wp-filter]").forEach(b => b.classList.remove("active"));
       btn.classList.add("active");
       state.wpMediaFilter = btn.dataset.wpFilter;
-      loadWallpapers();
+      loadTagView("wallpapers", false);
     });
   });
 
@@ -1422,33 +1538,43 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("keydown", e => {
     if (document.getElementById("modal").classList.contains("hidden")) return;
     if (e.key === "Escape") closeModal();
-    if (e.key === "ArrowLeft") modalPrev.click();
-    if (e.key === "ArrowRight") modalNext.click();
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      // Arrows switch items. Without preventDefault a focused video also
+      // seeked on the same key press (seek with the progress bar instead).
+      e.preventDefault();
+      (e.key === "ArrowLeft" ? modalPrev : modalNext).click();
+    }
   });
 
   // Clear thumbnail cache
   const clearCacheBtn = document.getElementById("clear-cache-btn");
+  const clearCacheHtml = clearCacheBtn.innerHTML;
   clearCacheBtn.style.display = "";
   clearCacheBtn.addEventListener("click", async () => {
     if (!confirm("Удалить все кешированные превью? Они пересоздадутся в высоком качестве при следующем просмотре.")) return;
     clearCacheBtn.disabled = true;
-    clearCacheBtn.querySelector("span") && (clearCacheBtn.innerHTML = "⏳ Удаляю...");
+    clearCacheBtn.textContent = "⏳ Удаляю...";
     try {
       const res = await api("/api/clear-cache");
-      clearCacheBtn.innerHTML = `✓ Удалено ${res.deleted} файлов`;
-      setTimeout(() => {
-        clearCacheBtn.innerHTML = `
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.51"/>
-          </svg> Сбросить кеш`;
-        clearCacheBtn.disabled = false;
-      }, 2000);
+      clearCacheBtn.textContent = `✓ Удалено ${res.deleted} файлов`;
       // Reload so images regenerate lazily
       load();
     } catch (e) {
-      clearCacheBtn.disabled = false;
+      clearCacheBtn.textContent = "Ошибка";
     }
+    setTimeout(() => {
+      clearCacheBtn.innerHTML = clearCacheHtml;
+      clearCacheBtn.disabled = false;
+    }, 2000);
   });
+
+  // Paging, one pager per tab; each observes its tab's scrolling element
+  pagers.browse = new Pager({ page: "browse", sentinel: "load-more", scrollRoot: "content-area",
+                              onPage: appendBrowsePage });
+  pagers.favorites = new Pager({ page: "favorites", sentinel: "fav-load-more", scrollRoot: "fav-content",
+                                 onPage: data => appendTagPage("favorites", data) });
+  pagers.wallpapers = new Pager({ page: "wallpapers", sentinel: "wp-load-more", scrollRoot: "wp-content",
+                                  onPage: data => appendTagPage("wallpapers", data) });
 
   if (state.root) load();
 });

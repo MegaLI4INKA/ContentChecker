@@ -27,6 +27,10 @@
     </svg>
     <input id="search-input" type="text" placeholder="Поиск по именам файлов..." autocomplete="off">
   </div>
+  <label class="search-deep" title="Искать по всей глубине текущей папки. Без галочки — только в ней самой и её прямых подпапках">
+    <input type="checkbox" id="search-deep">
+    Во всех подпапках
+  </label>
 </header>
 
 <!-- TABS -->
@@ -246,6 +250,10 @@
         <p>Введите путь к папке с медиафайлами выше, чтобы начать просмотр</p>
       </div>
       <div id="folders-container" class="folders-grid hidden"></div>
+      <!-- Next page of folders loads when this comes into view (button = manual fallback) -->
+      <div id="load-more" class="load-more hidden">
+        <button id="load-more-btn" class="show-more-btn">Загрузить ещё</button>
+      </div>
       <div id="loading" class="loading hidden">
         <div class="spinner"></div>
         <p>Загрузка...</p>
@@ -311,7 +319,12 @@
         </div>
         <span id="fav-count" class="toolbar-info"></span>
       </div>
-      <div id="fav-content"></div>
+      <div id="fav-content">
+        <div id="fav-list" class="tag-list"></div>
+        <div id="fav-load-more" class="load-more hidden">
+          <button class="show-more-btn">Загрузить ещё</button>
+        </div>
+      </div>
     </div>
 
     <div id="wallpaper-area" class="hidden">
@@ -360,7 +373,12 @@
         </div>
         <span id="wp-count" class="toolbar-info"></span>
       </div>
-      <div id="wp-content"></div>
+      <div id="wp-content">
+        <div id="wp-list" class="tag-list"></div>
+        <div id="wp-load-more" class="load-more hidden">
+          <button class="show-more-btn">Загрузить ещё</button>
+        </div>
+      </div>
     </div>
   </main>
 </div>
