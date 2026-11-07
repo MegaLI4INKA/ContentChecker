@@ -6,6 +6,7 @@ import os
 import platform
 import subprocess
 import hashlib
+import ipaddress
 import logging
 import threading
 import time
@@ -16,9 +17,10 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 try:  # HEIC/HEIF support for Pillow (optional dependency)
@@ -58,13 +60,36 @@ _opened_roots: set[Path] = set()
 _client_is_local: ContextVar[bool] = ContextVar("client_is_local", default=not LAN_MODE)
 
 
-class LocalClientMiddleware:
+def _lan_host_ok(host_header: str) -> bool:
+    """LAN mode: the server is addressed by an IP, "localhost" or a Bonjour
+    name (*.local). Any other name means DNS rebinding: a web page made its own
+    domain point at this server to talk to it as if from the same site."""
+    if host_header.startswith("["):  # [IPv6]:port
+        host = host_header[1:host_header.find("]")]
+    else:
+        host = host_header.split(":")[0]
+    host = host.lower()
+    if host == "localhost" or host.endswith(".local"):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+class LanGuardMiddleware:
+    """LAN mode: checks the Host header and marks whether the request comes
+    from this computer (see ensure_allowed)."""
     def __init__(self, asgi_app):
         self.app = asgi_app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        host = dict(scope.get("headers") or []).get(b"host", b"").decode("latin-1")
+        if not _lan_host_ok(host):
+            return await PlainTextResponse("Invalid host header", 400)(scope, receive, send)
         client = scope.get("client")
         token = _client_is_local.set(bool(client) and client[0] in ("127.0.0.1", "::1"))
         try:
@@ -74,7 +99,7 @@ class LocalClientMiddleware:
 
 
 if LAN_MODE:
-    app.add_middleware(LocalClientMiddleware)
+    app.add_middleware(LanGuardMiddleware)
 else:
     # Only accept requests addressed to localhost — blocks DNS-rebinding attacks
     # where a web page in your browser talks to this server under a foreign name.
@@ -159,6 +184,18 @@ def parse_best_level(name: str, is_dir: bool = False) -> int:
 def has_wallpaper_tag(name: str, is_dir: bool = False) -> bool:
     """True if the name has a standalone _wallpaper token."""
     return "wallpaper" in _tag_base(name, is_dir).split("_")
+
+
+def with_stars(name: str, level: int, is_dir: bool = False) -> str:
+    """The name with exactly `level` trailing _best tokens (the inverse of
+    parse_best_level): 'clip.mp4', 2 → 'clip_best_best.mp4'; 'Paris_best', 0 → 'Paris'.
+    Other tags (_wallpaper) and the case of the rest of the name are kept."""
+    stem, ext = (name, "") if is_dir else os.path.splitext(name)
+    while stem.lower().endswith("_best"):
+        stem = stem[:-5]
+    if not stem:
+        raise HTTPException(400, "Нельзя убрать звёзды: от имени ничего не останется")
+    return stem + "_best" * level + ext
 
 
 # ── Filesystem helpers ─────────────────────────────────────────────────────────
@@ -829,6 +866,51 @@ def open_location(path: str = Query(...)):
         raise HTTPException(500, str(e))
 
 
+class StarsRequest(BaseModel):
+    path: str
+    level: int = Field(ge=0, le=3)
+
+
+def require_app_request(request: Request) -> None:
+    """Changes on disk are accepted only from the app's own page. Another site
+    open in the browser can't add a custom header to a request to this server
+    without a CORS preflight, which this server never answers — so its forms
+    and fetches are refused here."""
+    if request.headers.get("x-contentchecker") != "1":
+        raise HTTPException(403, "Запрос не из ContentChecker")
+
+
+@app.post("/api/stars")
+def set_stars(req: StarsRequest, request: Request):
+    """Set the stars of a photo, video or folder by renaming it: 0–3 trailing
+    _best. Video frames survive (their cache key doesn't depend on the name)."""
+    require_app_request(request)
+    p = ensure_allowed(norm(req.path))
+    if not p.exists():
+        raise HTTPException(404, "Файл или папка не найдены")
+    folder = p.is_dir()
+    if folder:
+        if os.path.ismount(p) or p.parent == p:
+            raise HTTPException(400, "Это корень диска, его нельзя переименовать")
+    elif file_type(p.name) not in ("video", "image"):
+        raise HTTPException(400, "Звёзды ставятся только фото, видео и папкам")
+
+    new_name = with_stars(p.name, req.level, folder)
+    target = p.with_name(new_name)
+    if new_name != p.name:
+        # os.rename silently replaces an existing target — refuse instead. On a
+        # case-insensitive disk "x_BEST" → "x_best" is the same file, that's fine.
+        if os.path.lexists(target) and not os.path.samefile(p, target):
+            raise HTTPException(409, f"Уже есть «{new_name}», переименуйте вручную")
+        try:
+            os.rename(p, target)
+        except OSError as e:
+            raise HTTPException(500, f"Не удалось переименовать: {e.strerror}")
+        log.info("Stars: %r -> %r", p.name, new_name)
+    return {"path": str(target), "name": target.name,
+            "best_level": parse_best_level(target.name, is_dir=folder)}
+
+
 _MIME = {
     ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
     ".avi": "video/x-msvideo", ".mkv": "video/x-matroska",
@@ -973,6 +1055,7 @@ def tagged_page(root_path: Path, tags: dict, level: int, media: str, offset: int
         "counts": {"folders": len(folders), "videos": len(videos), "photos": len(images)},
         # everything tagged, regardless of filters (tab badge)
         "total": len(tags["folders"]) + len(tags["videos"]) + len(tags["images"]),
+        "root": str(root_path),
     }
 
 

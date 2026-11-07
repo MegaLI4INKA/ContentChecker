@@ -600,6 +600,45 @@ body {
 .video-card         { content-visibility: auto; contain-intrinsic-size: auto 260px; }
 .photo-folder-block { content-visibility: auto; contain-intrinsic-size: auto 700px; }
 
+/* ── Clickable stars (rating = "_best" in the name) ── */
+.star-ctl { display: inline-flex; align-items: center; line-height: 1; flex-shrink: 0; }
+.star-ctl button {
+  background: none; border: none; padding: 0 1px; margin: 0;
+  font-size: 13px; line-height: 1; cursor: pointer;
+  color: var(--text-mute); transition: color var(--transition), transform var(--transition);
+}
+.star-ctl button.on { color: #f0c040; }
+/* Hover previews the level: stars up to the hovered one light up */
+.star-ctl:hover button { color: #f0c040; }
+.star-ctl button:hover ~ button { color: var(--text-mute); }
+.star-ctl button:hover { transform: scale(1.2); }
+/* On photos: a small overlay in the corner, shown on hover unless set */
+.star-ctl.cell-stars {
+  position: absolute; top: 4px; right: 4px; z-index: 2;
+  background: rgba(0,0,0,.65); border-radius: 4px; padding: 2px 3px;
+}
+.star-ctl.cell-stars button { font-size: 11px; }
+.star-ctl.cell-stars:not(.has-stars) { opacity: 0; transition: opacity var(--transition); }
+.photo-cell:hover .star-ctl.cell-stars,
+.photo-large-cell:hover .star-ctl.cell-stars { opacity: 1; }
+/* Folder card: looks like the other badges */
+.star-ctl.badge-stars {
+  border: 1px solid rgba(240,192,64,.35); background: rgba(240,192,64,.06);
+  border-radius: 20px; padding: 1px 5px;
+}
+.star-ctl.badge-stars button { font-size: 11px; }
+.star-ctl.modal-stars button { font-size: 18px; padding: 0 2px; }
+#modal-stars { margin-right: auto; margin-left: 4px; }
+
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px);
+  background: var(--bg-card); color: var(--text); border: 1px solid var(--border-hi);
+  border-radius: var(--radius-sm); padding: 10px 16px; font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.4); opacity: 0; pointer-events: none;
+  transition: opacity .2s, transform .2s; z-index: 1000; max-width: 80vw;
+}
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+
 /* Modal: a video format the browser can't play */
 .modal-unsupported {
   display: flex; flex-direction: column; align-items: center; gap: 10px;
