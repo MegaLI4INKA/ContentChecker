@@ -21,6 +21,9 @@ const state = {
   galleryItems: [],
   galleryIdx: 0,
   videoSpeed: 1,          // playback rate in the viewer, kept between videos and visits
+  // Volume and mute of the viewer's player, likewise kept
+  videoVolume: (x => x >= 0 && x <= 1 ? x : 1)(parseFloat(localStorage.getItem("cc_video_volume"))),
+  videoMuted: localStorage.getItem("cc_video_muted") === "1",
 };
 
 /* ── API helpers ───────────────────────────────────────────────────────────── */
@@ -177,13 +180,13 @@ async function fetchCategories() {
 // The folder listing is paged: the first page comes with the sidebar data, the
 // next ones through pagers.browse. All pages of one listing use the same URL
 // (filters frozen at the first page) + offset.
-const browseView = { folders: 0, files: 0, candidates: 0 };
+const browseView = { folders: 0, files: 0, candidates: 0, subfolders: 0 };
 
 async function loadBrowse() {
   const seq = ++loadSeq;
   const url = browseUrl();
   pagers.browse.start(url);
-  Object.assign(browseView, { folders: 0, files: 0, candidates: 0 });
+  Object.assign(browseView, { folders: 0, files: 0, candidates: 0, subfolders: 0 });
   showContent("loading");
   try {
     const [data, categories] = await Promise.all([api(url), fetchCategories()]);
@@ -221,8 +224,19 @@ function appendBrowsePage(data) {
   browseView.candidates = data.candidates;
   browseView.folders += data.folders.length;
   browseView.files += data.folders.reduce((s, f) => s + f.total_videos + f.total_images, 0);
+  if (data.subfolders) browseView.subfolders = data.subfolders.length;
 
-  if (!pagers.browse.more && browseView.folders === 0) { showEmpty(); return; }
+  if (!pagers.browse.more && browseView.folders === 0) {
+    // Without "Всё в одном списке" only the folder's own files are listed
+    // (the server's rule: no flat, file search, folder search, categories or
+    // folder star filter) — a folder of folders is then empty, say why
+    const onlyThisFolder = !state.flat && !state.search.trim() && !state.searchFolder.trim()
+                        && !state.categories.size && !state.bestFolder;
+    showEmpty(onlyThisFolder && browseView.subfolders
+      ? "Прямо в этой папке нет фото и видео — откройте подпапку слева или включите «Всё в одном списке»"
+      : undefined);
+    return;
+  }
   updateResultCount();
   setupLazyLoad();
 }
@@ -1198,6 +1212,15 @@ function renderModal(type, src, name) {
     // Speed changed in the player's own ⋮ menu: show it in the selector too
     v.addEventListener("ratechange", () => {
       if (VIDEO_SPEEDS.includes(v.playbackRate)) showVideoSpeed(v.playbackRate);
+    });
+    // The next video opens with the volume (and mute) the last one was left at
+    v.volume = state.videoVolume;
+    v.muted = state.videoMuted;
+    v.addEventListener("volumechange", () => {
+      state.videoVolume = v.volume;
+      state.videoMuted = v.muted;
+      localStorage.setItem("cc_video_volume", v.volume);
+      localStorage.setItem("cc_video_muted", v.muted ? "1" : "0");
     });
     // AVI, WMV, FLV and some MKV can't be played by browsers: say so instead
     // of leaving an empty player

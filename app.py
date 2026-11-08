@@ -535,7 +535,8 @@ def _listing_put(key: tuple, value) -> None:
 
 
 def browse_candidates(cur: Path, dirs: list[Path], recursive: bool, cat_filter: set[str],
-                      search_folder_lower: str, min_folder_best: int) -> list[Path]:
+                      search_folder_lower: str, min_folder_best: int,
+                      with_subfolders: bool) -> list[Path]:
     """Folders that may appear in the listing: everything decidable from folder
     names alone. Filters on folder contents are applied page by page."""
     # Recursive in flat mode / any deep search, OR when category filter is active
@@ -545,9 +546,14 @@ def browse_candidates(cur: Path, dirs: list[Path], recursive: bool, cat_filter: 
             p for p, entries in walk_dirs(cur)
             if any(media_type(f) in ("video", "image") and is_file(f) for f in entries)
         ]
-    else:
+    elif with_subfolders:
         # Current dir + immediate subfolders
         to_scan = [cur] + dirs
+    else:
+        # Without "Всё в одном списке": just the current folder — its subfolders
+        # are opened from the tree (their videos used to fill the page, e.g. a
+        # disk root showed the whole first level of the disk)
+        to_scan = [cur]
 
     candidates = []
     for folder in to_scan:
@@ -624,14 +630,19 @@ def browse(
     # A folder name search always does — like the sidebar tree, which shows
     # matches at any depth.
     recursive = flat or (search_deep and bool(search_file_lower)) or bool(search_folder_lower)
+    # Otherwise the listing is the current folder only. A file name search
+    # without that checkbox still covers the direct subfolders (as its tooltip
+    # says), and so does the folder star filter — it is about subfolders.
+    with_subfolders = bool(search_file_lower) or min_folder_best > 0
 
-    key = ("browse", str(cur), recursive, frozenset(cat_filter), search_folder_lower, min_folder_best)
+    key = ("browse", str(cur), recursive, frozenset(cat_filter), search_folder_lower,
+           min_folder_best, with_subfolders)
     candidates = _listing_get(key) if offset else None
     dirs: list[Path] = []
     if candidates is None:
         dirs = subdirs(cur)
         candidates = browse_candidates(cur, dirs, recursive, cat_filter,
-                                       search_folder_lower, min_folder_best)
+                                       search_folder_lower, min_folder_best, with_subfolders)
         _listing_put(key, candidates)
 
     result: list[dict] = []
