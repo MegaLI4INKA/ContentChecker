@@ -806,6 +806,11 @@ let starsBusy = false;
 async function setStars(path, level, isDir = false) {
   if (starsBusy) return null;  // one rename at a time: paths change under our feet
   starsBusy = true;
+  // A playing video keeps its file open on the server (some disks then refuse
+  // to rename it), and after the rename it would keep asking for the old name —
+  // seeking broke. Let go of it now and resume it under the new name below.
+  const held = releaseModalVideo(path);
+  let newPath = path;
   try {
     const r = await fetch("/api/stars", {
       method: "POST",
@@ -820,6 +825,7 @@ async function setStars(path, level, isDir = false) {
       return null;
     }
     const res = await r.json();  // {path, name, best_level}
+    newPath = res.path;
     retarget(path, res.path);
     document.querySelectorAll(".star-ctl").forEach(c => {
       if (c.dataset.path !== res.path) return;
@@ -834,8 +840,29 @@ async function setStars(path, level, isDir = false) {
     toast(`Не удалось изменить звёзды: ${e.message}`);
     return null;
   } finally {
+    if (held) resumeModalVideo(held, path, newPath);
     starsBusy = false;
   }
+}
+
+// Stops the modal's video if it is `path` or inside the folder `path`;
+// returns what is needed to resume it, or null.
+function releaseModalVideo(path) {
+  const v = document.querySelector("#modal-body video");
+  if (!v?.getAttribute("src")) return null;
+  const src = new URL(v.src).searchParams.get("path");
+  if (src !== path && !src.startsWith(path + "/")) return null;
+  const held = { v, src, time: v.currentTime, paused: v.paused };
+  stopModalVideo();
+  return held;
+}
+
+function resumeModalVideo({ v, src, time, paused }, oldPath, newPath) {
+  if (!v.isConnected) return;  // the modal moved on meanwhile
+  const moved = src === oldPath ? newPath : newPath + src.slice(oldPath.length);
+  v.autoplay = !paused;
+  v.src = `/file?path=${encodeURIComponent(moved)}`;
+  v.currentTime = time;  // before metadata arrives = start position
 }
 
 // After a rename, point everything that referenced the old path — or, for a
@@ -1093,16 +1120,30 @@ let observer = null;
 // was replaced wholesale (drops the old, now detached, images). Appending a page
 // or "+N ещё" must not reset: re-observing every image on each page made paging
 // quadratic, and re-loading visible ones re-requested frames.
+// A thumbnail loads only after staying near the screen for LAZY_DWELL_MS:
+// flicking through a long list used to start a frame extraction for every
+// video it passed (180 frames for 15 left on screen), which kept the CPU busy
+// for minutes and queued the player's own requests behind them.
+const LAZY_DWELL_MS = 150;
+
 function setupLazyLoad(reset = false) {
   if (reset || !observer) {
     observer?.disconnect();
-    observer = new IntersectionObserver(entries => {
+    const obs = observer = new IntersectionObserver(entries => {
       entries.forEach(entry => {
-        if (!entry.isIntersecting) return;
         const img = entry.target;
-        observer.unobserve(img);
-        img.dataset.lazy = "started";
-        loadThumb(img);
+        if (!entry.isIntersecting) {
+          clearTimeout(img._lazyTimer);
+          img._lazyTimer = null;
+          return;
+        }
+        img._lazyTimer ??= setTimeout(() => {
+          img._lazyTimer = null;
+          if (observer !== obs || !img.isConnected) return;  // content was replaced
+          obs.unobserve(img);
+          img.dataset.lazy = "started";
+          loadThumb(img);
+        }, LAZY_DWELL_MS);
       });
     }, { rootMargin: "150px" });
   }
@@ -1321,7 +1362,8 @@ function renderModal(type, src, name) {
   const title = document.getElementById("modal-title");
   title.textContent = name;
   title.dataset.path = src;  // kept in sync if the item gets renamed (stars)
-  document.getElementById("modal-open").onclick = () => openLocation(src);
+  // The current path, not `src`: the item may get renamed while shown (stars)
+  document.getElementById("modal-open").onclick = () => openLocation(title.dataset.path);
 
   // Stars of the shown item; the control shares the data object with the card
   const g = state.galleryItems[state.galleryIdx];
@@ -1344,13 +1386,20 @@ function renderModal(type, src, name) {
     v.addEventListener("error", () => {
       if (!v.isConnected || !v.getAttribute("src")) return;  // already replaced/stopped
       const ext = (src.split(".").pop() || "").toUpperCase();
+      // Only format/decoding errors mean "unsupported"; a failed download
+      // (file moved, disk unplugged, server stopped) is something else
+      const unsupported = v.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
+                       || v.error?.code === MediaError.MEDIA_ERR_DECODE;
       body.innerHTML = `
         <div class="modal-unsupported">
-          <p>Браузер не умеет воспроизводить этот файл (${escapeHtml(ext)}).</p>
-          <p>Откройте его в видеоплеере, например IINA или VLC.</p>
+          ${unsupported
+            ? `<p>Браузер не умеет воспроизводить этот файл (${escapeHtml(ext)}).</p>
+               <p>Откройте его в видеоплеере, например IINA или VLC.</p>`
+            : `<p>Не удалось загрузить видео.</p>
+               <p>Возможно, файл переместили или диск отключён.</p>`}
           <button class="btn-primary">Показать в Finder</button>
         </div>`;
-      body.querySelector("button").addEventListener("click", () => openLocation(src));
+      body.querySelector("button").addEventListener("click", () => openLocation(title.dataset.path));
     });
     body.appendChild(v);
   } else {

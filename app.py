@@ -1,5 +1,6 @@
 import asyncio
 import codecs
+import errno
 import io
 import json
 import os
@@ -17,6 +18,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
+import anyio
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -737,6 +739,14 @@ def get_thumb(filename: str):
                         headers={"Cache-Control": "public, max-age=86400"})
 
 
+# Photo previews are decoded in a pool of their own, bounded like video frames.
+# A JPEG takes ~0.1 s of CPU, but a HEIC (iPhone) photo ~1 s and libheif uses
+# several threads per photo; one browser asks for 6 at once, phones in LAN
+# mode for more — the default executor ran them all and loaded every core.
+_image_pool = ThreadPoolExecutor(max_workers=min(3, os.cpu_count() or 2),
+                                 thread_name_prefix="images")
+
+
 @app.get("/api/thumb")
 async def api_thumb(src: str = Query(...),
                     max_dim: int = Query(THUMB_MAX, alias="max", ge=16, le=8192)):
@@ -745,7 +755,7 @@ async def api_thumb(src: str = Query(...),
     Also used by the modal for formats browsers can't show (HEIC, TIFF)."""
     p = open_file(src)
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, resize_image_to_bytes, p, max_dim)
+    data = await loop.run_in_executor(_image_pool, resize_image_to_bytes, p, max_dim)
     if data is None:
         raise HTTPException(500, "Could not process image")
     return Response(
@@ -880,6 +890,27 @@ def require_app_request(request: Request) -> None:
         raise HTTPException(403, "Запрос не из ContentChecker")
 
 
+def is_busy(e: OSError) -> bool:
+    """The file (or one inside the folder) is open somewhere and the disk
+    doesn't allow renaming it then: network shares, NTFS/exFAT drives, Windows."""
+    return e.errno == errno.EBUSY or getattr(e, "winerror", None) == 32  # sharing violation
+
+
+def rename_when_free(src: Path, dst: Path, wait: float = 2.0) -> None:
+    """os.rename, retried for a moment while the file is busy: the page lets go
+    of a playing video right before renaming it, and the server's stream of it
+    and frame extraction may need a few hundred ms to close the file."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            os.rename(src, dst)
+            return
+        except OSError as e:
+            if not is_busy(e) or time.monotonic() > deadline:
+                raise
+        time.sleep(0.2)
+
+
 @app.post("/api/stars")
 def set_stars(req: StarsRequest, request: Request):
     """Set the stars of a photo, video or folder by renaming it: 0–3 trailing
@@ -903,8 +934,12 @@ def set_stars(req: StarsRequest, request: Request):
         if os.path.lexists(target) and not os.path.samefile(p, target):
             raise HTTPException(409, f"Уже есть «{new_name}», переименуйте вручную")
         try:
-            os.rename(p, target)
+            rename_when_free(p, target)
         except OSError as e:
+            log.warning("Stars: can't rename %r: %s", str(p), e)
+            if is_busy(e):
+                raise HTTPException(409, "Файл открыт в другой программе (плеер, редактор, "
+                                         "синхронизация) — закройте его там и попробуйте снова")
             raise HTTPException(500, f"Не удалось переименовать: {e.strerror}")
         log.info("Stars: %r -> %r", p.name, new_name)
     return {"path": str(target), "name": target.name,
@@ -925,12 +960,33 @@ _MIME = {
 }
 
 
+class MediaFileResponse(FileResponse):
+    """FileResponse that stops as soon as the browser hangs up.
+
+    A video player drops its request on every seek (and when it's closed) and
+    opens a new one from the new position. Plain FileResponse doesn't notice:
+    it kept reading the file to its very end into the void — gigabytes per
+    seek on big videos. Those reads competed with the new request (seeking
+    stalled), loaded the disk and kept the file open for a long time."""
+
+    async def __call__(self, scope, receive, send):
+        async with anyio.create_task_group() as tg:
+            async def respond():
+                await FileResponse.__call__(self, scope, receive, send)
+                tg.cancel_scope.cancel()
+
+            tg.start_soon(respond)
+            while (await receive())["type"] != "http.disconnect":
+                pass
+            tg.cancel_scope.cancel()
+
+
 @app.get("/file")
 def serve_file(path: str = Query(...)):
-    # Starlette's FileResponse handles Range itself (single, multi, suffix
-    # "bytes=-N", If-Range) and sets ETag/Last-Modified — needed for video seeking.
+    # FileResponse handles Range itself (single, multi, suffix "bytes=-N",
+    # If-Range) and sets ETag/Last-Modified — needed for video seeking.
     p = open_file(path)
-    return FileResponse(p, media_type=_MIME.get(p.suffix.lower(), "application/octet-stream"))
+    return MediaFileResponse(p, media_type=_MIME.get(p.suffix.lower(), "application/octet-stream"))
 
 
 @app.get("/api/clear-cache")
