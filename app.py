@@ -655,13 +655,17 @@ def browse(
         "candidates": len(candidates),  # upper bound of folders in the whole listing
     }
     if offset == 0:  # sidebar data is needed once per listing
-        crumbs = [{"name": root_path.name, "path": ""}]
-        parts = cur.relative_to(root_path).parts
-        for n, part in enumerate(parts):
-            crumbs.append({"name": part, "path": "/".join(parts[: n + 1])})
         response["subfolders"] = [subfolder_info(e, root_path) for e in dirs]
-        response["breadcrumbs"] = crumbs
+        response["breadcrumbs"] = breadcrumbs(root_path, cur)
     return response
+
+
+def breadcrumbs(root_path: Path, cur: Path) -> list[dict]:
+    crumbs = [{"name": root_path.name, "path": ""}]
+    parts = cur.relative_to(root_path).parts
+    for n, part in enumerate(parts):
+        crumbs.append({"name": part, "path": "/".join(parts[: n + 1])})
+    return crumbs
 
 
 @app.get("/api/search-folders")
@@ -690,10 +694,12 @@ def search_folders(root: str = Query(...), q: str = Query(...)):
 
 @app.get("/api/children")
 def get_children(root: str = Query(...), path: str = Query("")):
-    """Return immediate subdirectories of a given path (for sidebar tree expansion)."""
+    """Return immediate subdirectories of a given path (for sidebar tree expansion,
+    and the sidebar of tabs other than Просмотр — hence the breadcrumbs)."""
     root_path = open_root(root)
     cur = open_subdir(root_path, path)
-    return {"children": [subfolder_info(e, root_path) for e in subdirs(cur)]}
+    return {"children": [subfolder_info(e, root_path) for e in subdirs(cur)],
+            "breadcrumbs": breadcrumbs(root_path, cur)}
 
 
 @app.get("/api/categories")

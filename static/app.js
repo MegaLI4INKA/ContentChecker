@@ -20,6 +20,7 @@ const state = {
   wpMediaFilter: "all",   // "all" | "videos" | "photos" — wallpapers tab
   galleryItems: [],
   galleryIdx: 0,
+  videoSpeed: 1,          // playback rate in the viewer, kept between videos and visits
 };
 
 /* ── API helpers ───────────────────────────────────────────────────────────── */
@@ -249,6 +250,23 @@ function showContent(id) {
 }
 
 /* ── Sidebar ───────────────────────────────────────────────────────────────── */
+// The sidebar (breadcrumbs, folder tree, categories) without the folder
+// listing: Просмотр renders it with its first page, but the app opens on
+// Favorites, which otherwise left "Укажите путь к папке" there.
+async function loadSidebar() {
+  try {
+    const [data, categories] = await Promise.all([
+      api(`/api/children?root=${encodeURIComponent(state.root)}&path=${encodeURIComponent(state.path)}`),
+      fetchCategories(),
+    ]);
+    renderSidebar({ breadcrumbs: data.breadcrumbs, subfolders: data.children }, categories);
+    // star filters belong to Просмотр
+    document.getElementById("best-section").classList.toggle("hidden", state.page !== "browse");
+  } catch (e) {
+    console.error(e);
+  }
+}
+
 function renderSidebar(data, categories) {
   document.getElementById("sidebar-empty").classList.add("hidden");
   document.getElementById("sidebar-content").classList.remove("hidden");
@@ -1168,11 +1186,19 @@ function renderModal(type, src, name) {
   stopModalVideo();
   body.innerHTML = "";
 
+  document.getElementById("modal-speed").classList.toggle("hidden", type !== "video");
+
   if (type === "video") {
     const v = document.createElement("video");
     v.src = `/file?path=${encodeURIComponent(src)}`;
     v.controls = true;
     v.autoplay = true;
+    // defaultPlaybackRate survives the load; playbackRate alone is reset by it
+    v.defaultPlaybackRate = v.playbackRate = state.videoSpeed;
+    // Speed changed in the player's own ⋮ menu: show it in the selector too
+    v.addEventListener("ratechange", () => {
+      if (VIDEO_SPEEDS.includes(v.playbackRate)) showVideoSpeed(v.playbackRate);
+    });
     // AVI, WMV, FLV and some MKV can't be played by browsers: say so instead
     // of leaving an empty player
     v.addEventListener("error", () => {
@@ -1210,6 +1236,28 @@ function renderModal(type, src, name) {
   } else {
     nav.classList.add("hidden");
   }
+}
+
+// Video speed in the viewer: the selector in the header or keys [ and ]
+// (by key position, so they also work in the Russian layout: х and ъ)
+const VIDEO_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 5];
+
+function setVideoSpeed(rate) {
+  showVideoSpeed(rate);
+  const v = document.querySelector("#modal-body video");
+  if (v) v.defaultPlaybackRate = v.playbackRate = rate;
+}
+
+function showVideoSpeed(rate) {
+  state.videoSpeed = rate;
+  localStorage.setItem("cc_video_speed", rate);
+  document.getElementById("modal-speed").value = String(rate);
+}
+
+function stepVideoSpeed(dir) {
+  const i = VIDEO_SPEEDS.indexOf(state.videoSpeed);
+  const next = Math.max(0, Math.min(VIDEO_SPEEDS.length - 1, (i < 0 ? VIDEO_SPEEDS.indexOf(1) : i) + dir));
+  setVideoSpeed(VIDEO_SPEEDS[next]);
 }
 
 function updateModalNav() {
@@ -1303,6 +1351,7 @@ document.addEventListener("DOMContentLoaded", () => {
     state.categories.clear();
     catsCache.key = null;  // "Открыть" also works as "refresh from disk"
     load();
+    if (state.page !== "browse" && state.root) loadSidebar();  // Просмотр renders its own
   });
   rootInput.addEventListener("keydown", e => { if (e.key === "Enter") loadBtn.click(); });
 
@@ -1538,6 +1587,15 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("wp-show-texts-btn").addEventListener("click", toggleTexts);
 
   // Modal
+  const speedSelect = document.getElementById("modal-speed");
+  speedSelect.innerHTML = VIDEO_SPEEDS.map(r => `<option value="${r}">×${r}</option>`).join("");
+  const savedSpeed = +localStorage.getItem("cc_video_speed");
+  showVideoSpeed(VIDEO_SPEEDS.includes(savedSpeed) ? savedSpeed : 1);
+  speedSelect.addEventListener("change", () => {
+    setVideoSpeed(+speedSelect.value);
+    speedSelect.blur();  // arrow keys go back to switching videos
+  });
+
   modalClose.addEventListener("click", closeModal);
   document.getElementById("modal-backdrop").addEventListener("click", closeModal);
 
@@ -1561,6 +1619,11 @@ document.addEventListener("DOMContentLoaded", () => {
     if (e.key === "Escape") closeModal();
     if (e.key === "ArrowLeft") modalPrev.click();
     if (e.key === "ArrowRight") modalNext.click();
+    if ((e.code === "BracketLeft" || e.code === "BracketRight") && !e.metaKey && !e.ctrlKey
+        && document.querySelector("#modal-body video")) {
+      e.preventDefault();
+      stepVideoSpeed(e.code === "BracketRight" ? 1 : -1);
+    }
   });
 
   // Clear thumbnail cache
@@ -1593,5 +1656,9 @@ document.addEventListener("DOMContentLoaded", () => {
   pagers.wallpapers = new Pager({ page: "wallpapers", sentinel: "wp-load-more", scrollRoot: "wp-content",
                                   onPage: data => appendTagPage("wallpapers", data) });
 
-  if (state.root) load();
+  // The app opens on Favorites (the welcome screen until a folder is chosen)
+  if (state.root) {
+    switchPage("favorites");
+    loadSidebar();
+  }
 });
