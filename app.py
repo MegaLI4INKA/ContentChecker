@@ -1,6 +1,5 @@
 import asyncio
 import codecs
-import errno
 import io
 import json
 import os
@@ -18,11 +17,9 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
-import anyio
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 try:  # HEIC/HEIF support for Pillow (optional dependency)
@@ -186,18 +183,6 @@ def parse_best_level(name: str, is_dir: bool = False) -> int:
 def has_wallpaper_tag(name: str, is_dir: bool = False) -> bool:
     """True if the name has a standalone _wallpaper token."""
     return "wallpaper" in _tag_base(name, is_dir).split("_")
-
-
-def with_stars(name: str, level: int, is_dir: bool = False) -> str:
-    """The name with exactly `level` trailing _best tokens (the inverse of
-    parse_best_level): 'clip.mp4', 2 → 'clip_best_best.mp4'; 'Paris_best', 0 → 'Paris'.
-    Other tags (_wallpaper) and the case of the rest of the name are kept."""
-    stem, ext = (name, "") if is_dir else os.path.splitext(name)
-    while stem.lower().endswith("_best"):
-        stem = stem[:-5]
-    if not stem:
-        raise HTTPException(400, "Нельзя убрать звёзды: от имени ничего не останется")
-    return stem + "_best" * level + ext
 
 
 # ── Filesystem helpers ─────────────────────────────────────────────────────────
@@ -876,76 +861,6 @@ def open_location(path: str = Query(...)):
         raise HTTPException(500, str(e))
 
 
-class StarsRequest(BaseModel):
-    path: str
-    level: int = Field(ge=0, le=3)
-
-
-def require_app_request(request: Request) -> None:
-    """Changes on disk are accepted only from the app's own page. Another site
-    open in the browser can't add a custom header to a request to this server
-    without a CORS preflight, which this server never answers — so its forms
-    and fetches are refused here."""
-    if request.headers.get("x-contentchecker") != "1":
-        raise HTTPException(403, "Запрос не из ContentChecker")
-
-
-def is_busy(e: OSError) -> bool:
-    """The file (or one inside the folder) is open somewhere and the disk
-    doesn't allow renaming it then: network shares, NTFS/exFAT drives, Windows."""
-    return e.errno == errno.EBUSY or getattr(e, "winerror", None) == 32  # sharing violation
-
-
-def rename_when_free(src: Path, dst: Path, wait: float = 2.0) -> None:
-    """os.rename, retried for a moment while the file is busy: the page lets go
-    of a playing video right before renaming it, and the server's stream of it
-    and frame extraction may need a few hundred ms to close the file."""
-    deadline = time.monotonic() + wait
-    while True:
-        try:
-            os.rename(src, dst)
-            return
-        except OSError as e:
-            if not is_busy(e) or time.monotonic() > deadline:
-                raise
-        time.sleep(0.2)
-
-
-@app.post("/api/stars")
-def set_stars(req: StarsRequest, request: Request):
-    """Set the stars of a photo, video or folder by renaming it: 0–3 trailing
-    _best. Video frames survive (their cache key doesn't depend on the name)."""
-    require_app_request(request)
-    p = ensure_allowed(norm(req.path))
-    if not p.exists():
-        raise HTTPException(404, "Файл или папка не найдены")
-    folder = p.is_dir()
-    if folder:
-        if os.path.ismount(p) or p.parent == p:
-            raise HTTPException(400, "Это корень диска, его нельзя переименовать")
-    elif file_type(p.name) not in ("video", "image"):
-        raise HTTPException(400, "Звёзды ставятся только фото, видео и папкам")
-
-    new_name = with_stars(p.name, req.level, folder)
-    target = p.with_name(new_name)
-    if new_name != p.name:
-        # os.rename silently replaces an existing target — refuse instead. On a
-        # case-insensitive disk "x_BEST" → "x_best" is the same file, that's fine.
-        if os.path.lexists(target) and not os.path.samefile(p, target):
-            raise HTTPException(409, f"Уже есть «{new_name}», переименуйте вручную")
-        try:
-            rename_when_free(p, target)
-        except OSError as e:
-            log.warning("Stars: can't rename %r: %s", str(p), e)
-            if is_busy(e):
-                raise HTTPException(409, "Файл открыт в другой программе (плеер, редактор, "
-                                         "синхронизация) — закройте его там и попробуйте снова")
-            raise HTTPException(500, f"Не удалось переименовать: {e.strerror}")
-        log.info("Stars: %r -> %r", p.name, new_name)
-    return {"path": str(target), "name": target.name,
-            "best_level": parse_best_level(target.name, is_dir=folder)}
-
-
 _MIME = {
     ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
     ".avi": "video/x-msvideo", ".mkv": "video/x-matroska",
@@ -960,33 +875,62 @@ _MIME = {
 }
 
 
-class MediaFileResponse(FileResponse):
-    """FileResponse that stops as soon as the browser hangs up.
-
-    A video player drops its request on every seek (and when it's closed) and
-    opens a new one from the new position. Plain FileResponse doesn't notice:
-    it kept reading the file to its very end into the void — gigabytes per
-    seek on big videos. Those reads competed with the new request (seeking
-    stalled), loaded the disk and kept the file open for a long time."""
-
-    async def __call__(self, scope, receive, send):
-        async with anyio.create_task_group() as tg:
-            async def respond():
-                await FileResponse.__call__(self, scope, receive, send)
-                tg.cancel_scope.cancel()
-
-            tg.start_soon(respond)
-            while (await receive())["type"] != "http.disconnect":
-                pass
-            tg.cancel_scope.cancel()
-
-
 @app.get("/file")
-def serve_file(path: str = Query(...)):
-    # FileResponse handles Range itself (single, multi, suffix "bytes=-N",
-    # If-Range) and sets ETag/Last-Modified — needed for video seeking.
+def serve_file(request: Request, path: str = Query(...)):
     p = open_file(path)
-    return MediaFileResponse(p, media_type=_MIME.get(p.suffix.lower(), "application/octet-stream"))
+
+    file_size = p.stat().st_size
+    media_type = _MIME.get(p.suffix.lower(), "application/octet-stream")
+    range_header = request.headers.get("Range")
+
+    CHUNK = 1 << 16  # 64 KB
+
+    def stream_range(start: int, end: int):
+        with open(p, "rb") as f:
+            f.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                data = f.read(min(CHUNK, remaining))
+                if not data:
+                    break
+                yield data
+                remaining -= len(data)
+
+    if not range_header:
+        # Full file with Accept-Ranges so browser knows seeking is supported
+        return StreamingResponse(
+            stream_range(0, file_size - 1),
+            media_type=media_type,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(file_size),
+            },
+        )
+
+    # Parse "bytes=start-end" (end may be omitted)
+    try:
+        raw = range_header.strip().removeprefix("bytes=")
+        s, e = raw.split("-")
+        start = int(s)
+        end = int(e) if e else file_size - 1
+        end = min(end, file_size - 1)
+    except Exception:
+        raise HTTPException(416, "Invalid Range header")
+
+    if start > end or start >= file_size:
+        raise HTTPException(416, "Range Not Satisfiable")
+
+    chunk_len = end - start + 1
+    return StreamingResponse(
+        stream_range(start, end),
+        status_code=206,
+        media_type=media_type,
+        headers={
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(chunk_len),
+        },
+    )
 
 
 @app.get("/api/clear-cache")
@@ -1111,7 +1055,6 @@ def tagged_page(root_path: Path, tags: dict, level: int, media: str, offset: int
         "counts": {"folders": len(folders), "videos": len(videos), "photos": len(images)},
         # everything tagged, regardless of filters (tab badge)
         "total": len(tags["folders"]) + len(tags["videos"]) + len(tags["images"]),
-        "root": str(root_path),
     }
 
 

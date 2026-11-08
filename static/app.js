@@ -187,8 +187,6 @@ async function loadBrowse() {
   try {
     const [data, categories] = await Promise.all([api(url), fetchCategories()]);
     if (seq !== loadSeq) return;
-    state.rootResolved = data.root;  // absolute paths in responses start with it
-    state.lastBrowse = { root: data.root, breadcrumbs: data.breadcrumbs, subfolders: data.subfolders };
     renderSidebar(data, categories);
     document.getElementById("folders-container").innerHTML = "";
     state.galleryItems = [];
@@ -525,6 +523,7 @@ function buildVideoCard(video, folder) {
   const card = document.createElement("div");
   card.className = "video-card";
 
+  const bestLevel = video.best_level || 0;
   const frames    = video.frames;            // [{url, idx, pos}, ...]
   const frameCount = frames.length;
 
@@ -548,17 +547,15 @@ function buildVideoCard(video, folder) {
       <div class="video-card-dots">${dotsHtml}</div>
     </div>
     <div class="video-card-info">
-      <div class="video-card-name" data-name-of="${escapeHtml(video.path)}" title="${escapeHtml(video.name)}">${escapeHtml(video.name)}</div>
+      <div class="video-card-name" title="${escapeHtml(video.name)}">${escapeHtml(video.name)}</div>
       <div class="video-card-meta">
         <div class="video-card-folder" title="${escapeHtml(folder.path)}">📁 ${escapeHtml(folder.name)}</div>
         <div class="video-card-actions">
-          <span class="js-stars"></span>
+          ${bestLevel > 0 ? `<span class="stars">${starsHtml(bestLevel)}</span>` : ""}
           <button class="card-open-btn" style="padding:3px 8px;font-size:11px" title="Открыть расположение">↗</button>
         </div>
       </div>
     </div>`;
-
-  card.querySelector(".js-stars").replaceWith(starControl(video));
 
   const img          = card.querySelector("img");
   const progressFill = card.querySelector(".video-card-progress-fill");
@@ -577,7 +574,7 @@ function buildVideoCard(video, folder) {
 
   // Open modal
   const galleryIdx = state.galleryItems.length;
-  state.galleryItems.push({ src: video.path, name: video.name, type: "video", item: video });
+  state.galleryItems.push({ src: video.path, name: video.name, type: "video" });
   card.querySelector(".video-card-thumb").addEventListener("click", () =>
     openModal("video", video.path, video.name, galleryIdx)
   );
@@ -643,15 +640,16 @@ function buildVideoCard(video, folder) {
 
 /* ── Photos mode ───────────────────────────────────────────────────────────── */
 function makeLargePhotoCell(imgData) {
+  const iBest = imgData.best_level || 0;
   const natClass = state.naturalRatio ? " natural-ratio" : "";
   const cell = document.createElement("div");
   cell.className = `photo-large-cell${natClass}`;
   cell.innerHTML = `
     <img data-src="${escapeHtml(imageThumbUrl(imgData.path))}" data-kind="image" alt="${escapeHtml(imgData.name)}">
-    <div class="photo-name-overlay" data-name-of="${escapeHtml(imgData.path)}">${escapeHtml(imgData.name)}</div>`;
-  cell.prepend(starControl(imgData, { cls: "cell-stars" }));
+    ${iBest > 0 ? `<span class="file-star">${starsHtml(iBest)}</span>` : ""}
+    <div class="photo-name-overlay">${escapeHtml(imgData.name)}</div>`;
   const galleryIdx = state.galleryItems.length;
-  state.galleryItems.push({ src: imgData.path, name: imgData.name, type: "image", item: imgData });
+  state.galleryItems.push({ src: imgData.path, name: imgData.name, type: "image" });
   cell.addEventListener("click", () => openModal("image", imgData.path, imgData.name, galleryIdx));
   return cell;
 }
@@ -677,10 +675,7 @@ function addShowMore(folder, grid, makeCell, cellClass, style = "") {
     try {
       const res = await api(`/api/folder-images?path=${encodeURIComponent(folder.path)}` +
                             `&offset=${shown}&limit=${SHOW_MORE_BATCH}${folder.filesQuery || ""}`);
-      res.images.forEach(img => {
-        folder.images.push(img);  // reachable from the folder (paths updated if it's renamed)
-        grid.insertBefore(makeCell(img), more);
-      });
+      res.images.forEach(img => grid.insertBefore(makeCell(img), more));
       shown += res.images.length;
       folder.total_images = res.total;  // the folder may have changed since the listing
       if (!res.images.length || shown >= res.total) more.remove(); else label();
@@ -704,17 +699,15 @@ function renderPhotosMode(folders, container) {
     const block = document.createElement("div");
     block.className = "photo-folder-block";
 
-    // Synthetic blocks (single tagged photos from many folders) aren't a folder:
-    // no stars, no path to retarget
-    const real = !folder.synthetic;
+    const bestLevel = folder.best_level || 0;
     block.innerHTML = `
       <div class="photo-folder-block-header">
         <div>
           <div class="photo-folder-block-name">
-            📁 <span${real ? ` data-name-of="${escapeHtml(folder.path)}"` : ""}>${escapeHtml(folder.name)}</span>
-            <span class="js-stars"></span>
+            📁 ${escapeHtml(folder.name)}
+            ${bestLevel > 0 ? `<span class="stars" style="margin-left:6px">${starsHtml(bestLevel)}</span>` : ""}
           </div>
-          <div class="photo-folder-block-path"${real ? ` data-path-of="${escapeHtml(folder.path)}"` : ""}>${escapeHtml(folder.path)}</div>
+          <div class="photo-folder-block-path">${escapeHtml(folder.path)}</div>
         </div>
         <div class="photo-folder-block-meta">
           <span class="card-badge badge-photo">◼ ${folder.total_images} фото</span>
@@ -722,9 +715,6 @@ function renderPhotosMode(folders, container) {
         </div>
       </div>
       <div class="photos-large-grid"></div>`;
-
-    const starsSlot = block.querySelector(".js-stars");
-    if (real) starsSlot.replaceWith(starControl(folder, { isDir: true })); else starsSlot.remove();
 
     block.querySelector(".card-open-btn").addEventListener("click", e => {
       e.stopPropagation();
@@ -769,193 +759,6 @@ function renderPhotosMode(folders, container) {
   });
 }
 
-/* ── Stars (rating) ────────────────────────────────────────────────────────── */
-// Stars are part of the name: 0–3 trailing "_best". Clicking star N sets N
-// stars (clicking the current level clears them); the server renames the file
-// or folder and every place that shows it is updated in place — names, paths,
-// thumbnails, gallery, other star controls of the same item.
-function starControl(item, { isDir = false, cls = "" } = {}) {
-  const el = document.createElement("span");
-  el.className = `star-ctl ${cls}`;
-  el.dataset.path = item.path;
-  el.dataset.level = item.best_level || 0;
-  if (isDir) el.dataset.dir = "1";
-  el._item = item;  // the data object behind it (paths/levels kept in sync)
-  renderStarCtl(el);
-  el.addEventListener("click", e => {
-    const btn = e.target.closest("button[data-n]");
-    if (!btn) return;
-    e.stopPropagation();  // a star click on a photo must not open it
-    const n = +btn.dataset.n;
-    setStars(el.dataset.path, +el.dataset.level === n ? 0 : n, isDir);
-  });
-  return el;
-}
-
-function renderStarCtl(el) {
-  const lvl = +el.dataset.level;
-  el.classList.toggle("has-stars", lvl > 0);
-  el.innerHTML = [1, 2, 3].map(n =>
-    `<button type="button" data-n="${n}" class="${n <= lvl ? "on" : ""}"
-             title="${n === lvl ? "Убрать звёзды" : "★".repeat(n)}">${n <= lvl ? "★" : "☆"}</button>`
-  ).join("");
-}
-
-let starsBusy = false;
-
-async function setStars(path, level, isDir = false) {
-  if (starsBusy) return null;  // one rename at a time: paths change under our feet
-  starsBusy = true;
-  // A playing video keeps its file open on the server (some disks then refuse
-  // to rename it), and after the rename it would keep asking for the old name —
-  // seeking broke. Let go of it now and resume it under the new name below.
-  const held = releaseModalVideo(path);
-  let newPath = path;
-  try {
-    const r = await fetch("/api/stars", {
-      method: "POST",
-      // The custom header is how the server tells this page from other sites
-      headers: { "Content-Type": "application/json", "X-ContentChecker": "1" },
-      body: JSON.stringify({ path, level }),
-    });
-    if (!r.ok) {
-      let msg = `${r.status} ${r.statusText}`;
-      try { msg = (await r.json()).detail || msg; } catch (_) {}
-      toast(`Не удалось изменить звёзды: ${msg}`);
-      return null;
-    }
-    const res = await r.json();  // {path, name, best_level}
-    newPath = res.path;
-    retarget(path, res.path);
-    document.querySelectorAll(".star-ctl").forEach(c => {
-      if (c.dataset.path !== res.path) return;
-      c.dataset.level = res.best_level;
-      if (c._item) Object.assign(c._item, { name: res.name, best_level: res.best_level });
-      renderStarCtl(c);
-    });
-    state.galleryItems.forEach(g => { if (g.src === res.path) g.name = res.name; });
-    if (isDir && res.path !== path) await afterFolderRename(path, res.path);
-    return res;
-  } catch (e) {
-    toast(`Не удалось изменить звёзды: ${e.message}`);
-    return null;
-  } finally {
-    if (held) resumeModalVideo(held, path, newPath);
-    starsBusy = false;
-  }
-}
-
-// Stops the modal's video if it is `path` or inside the folder `path`;
-// returns what is needed to resume it, or null.
-function releaseModalVideo(path) {
-  const v = document.querySelector("#modal-body video");
-  if (!v?.getAttribute("src")) return null;
-  const src = new URL(v.src).searchParams.get("path");
-  if (src !== path && !src.startsWith(path + "/")) return null;
-  const held = { v, src, time: v.currentTime, paused: v.paused };
-  stopModalVideo();
-  return held;
-}
-
-function resumeModalVideo({ v, src, time, paused }, oldPath, newPath) {
-  if (!v.isConnected) return;  // the modal moved on meanwhile
-  const moved = src === oldPath ? newPath : newPath + src.slice(oldPath.length);
-  v.autoplay = !paused;
-  v.src = `/file?path=${encodeURIComponent(moved)}`;
-  v.currentTime = time;  // before metadata arrives = start position
-}
-
-// After a rename, point everything that referenced the old path — or, for a
-// folder, anything inside it — at the new one.
-function retarget(oldPath, newPath) {
-  if (oldPath === newPath) return;
-  const re = p => typeof p !== "string" ? p
-    : p === oldPath ? newPath
-    : p.startsWith(oldPath + "/") ? newPath + p.slice(oldPath.length) : p;
-
-  // Data objects behind the cards (click handlers read paths from them)
-  const seen = new Set();
-  const fix = obj => {
-    if (!obj || typeof obj !== "object" || seen.has(obj)) return;
-    seen.add(obj);
-    obj.path = re(obj.path);
-    if (obj.folder_path) obj.folder_path = re(obj.folder_path);
-    if ("rel" in obj && state.rootResolved && obj.path.startsWith(state.rootResolved + "/")) {
-      obj.rel = obj.path.slice(state.rootResolved.length + 1);
-    }
-    ["images", "videos", "texts"].forEach(k => obj[k]?.forEach(fix));
-  };
-  document.querySelectorAll(".star-ctl").forEach(c => {
-    c.dataset.path = re(c.dataset.path);
-    fix(c._item);
-  });
-  state.galleryItems.forEach(g => { g.src = re(g.src); fix(g.item); });
-
-  // Attributes baked into the HTML
-  document.querySelectorAll("[data-src-file]").forEach(el => { el.dataset.srcFile = re(el.dataset.srcFile); });
-  document.querySelectorAll('img[data-kind="image"][data-src]').forEach(img => {
-    const src = new URL(img.dataset.src, location.href).searchParams.get("src");
-    const moved = re(src);
-    if (moved !== src) img.dataset.src = imageThumbUrl(moved);
-  });
-  document.querySelectorAll("[data-name-of]").forEach(el => {
-    const moved = re(el.dataset.nameOf);
-    if (moved === el.dataset.nameOf) return;
-    el.dataset.nameOf = moved;
-    el.textContent = moved.split("/").pop();
-    if (el.title) el.title = el.textContent;
-  });
-  document.querySelectorAll("[data-path-of]").forEach(el => {
-    const moved = re(el.dataset.pathOf);
-    if (moved !== el.dataset.pathOf) { el.dataset.pathOf = moved; el.textContent = moved; }
-  });
-  const title = document.getElementById("modal-title");
-  if (title.dataset.path) {
-    const moved = re(title.dataset.path);
-    if (moved !== title.dataset.path) { title.dataset.path = moved; title.textContent = moved.split("/").pop(); }
-  }
-}
-
-// A renamed folder also changes the sidebar (tree, categories) and, if it is
-// the current folder or one of its parents, the current location itself.
-async function afterFolderRename(oldPath, newPath) {
-  catsCache.key = null;
-  const root = state.rootResolved;
-  const cur = state.path ? `${root}/${state.path}` : root;
-  if (root && (cur === oldPath || cur.startsWith(oldPath + "/"))) {
-    if (root === oldPath || root.startsWith(oldPath + "/")) {
-      state.root = newPath + root.slice(oldPath.length);
-      document.getElementById("root-input").value = state.root;
-    } else {
-      state.path = (newPath + cur.slice(oldPath.length)).slice(root.length + 1);
-    }
-    await load();
-    return;
-  }
-  if (state.page !== "browse" || !state.lastBrowse) return;
-  try {
-    const [kids, cats] = await Promise.all([
-      api(`/api/children?root=${encodeURIComponent(state.root)}&path=${encodeURIComponent(state.path)}`),
-      fetchCategories(),
-    ]);
-    renderSidebar({ ...state.lastBrowse, subfolders: kids.children }, cats);
-  } catch (e) {
-    console.error(e);
-  }
-}
-
-function toast(message) {
-  let t = document.getElementById("toast");
-  if (!t) {
-    t = addEl(document.body, "div", "toast");
-    t.id = "toast";
-  }
-  t.textContent = message;
-  t.classList.add("show");
-  clearTimeout(t._timer);
-  t._timer = setTimeout(() => t.classList.remove("show"), 4000);
-}
-
 /* ── Standard card (All mode) ──────────────────────────────────────────────── */
 function starsHtml(level) {
   return "★".repeat(Math.max(0, Math.min(3, level)));
@@ -968,9 +771,10 @@ function buildCard(folder) {
   const hasVideos = folder.videos.length > 0;
   const hasPhotos = folder.images.length > 0;
   const hasTexts  = folder.texts.length > 0;
+  const bestLevel = folder.best_level || 0;
 
   const badges = [
-    `<span class="js-stars"></span>`,
+    bestLevel > 0 ? `<span class="card-badge badge-best">${starsHtml(bestLevel)}</span>` : "",
     hasVideos ? `<span class="card-badge badge-video">▶ ${folder.total_videos} видео</span>` : "",
     hasPhotos ? `<span class="card-badge badge-photo">◼ ${folder.total_images} фото</span>` : "",
     hasTexts  ? `<span class="card-badge badge-text">✎ ${folder.texts.length} текст</span>` : "",
@@ -979,8 +783,8 @@ function buildCard(folder) {
   card.innerHTML = `
     <div class="card-header">
       <div class="card-header-info">
-        <div class="card-folder-name">📁 <span data-name-of="${escapeHtml(folder.path)}">${escapeHtml(folder.name)}</span></div>
-        <div class="card-folder-path" data-path-of="${escapeHtml(folder.path)}">${escapeHtml(folder.path)}</div>
+        <div class="card-folder-name" title="${escapeHtml(folder.path)}">📁 ${escapeHtml(folder.name)}</div>
+        <div class="card-folder-path">${escapeHtml(folder.path)}</div>
         <div class="card-meta">${badges}</div>
       </div>
       <div class="card-header-actions">
@@ -1000,8 +804,6 @@ function buildCard(folder) {
       </div>
     </div>`;
 
-  card.querySelector(".js-stars").replaceWith(starControl(folder, { isDir: true, cls: "badge-stars" }));
-
   card.querySelector(".card-nav-btn").addEventListener("click", e => {
     e.stopPropagation();
     navigate(folder.rel);
@@ -1013,25 +815,25 @@ function buildCard(folder) {
 
   // Videos
   folder.videos.forEach(video => {
+    const vBest = video.best_level || 0;
     const sec = document.createElement("div");
     sec.className = "card-section";
     sec.innerHTML = `
       <div class="card-section-label">
-        🎬 <span class="filename" data-name-of="${escapeHtml(video.path)}">${escapeHtml(video.name)}</span>
-        <span class="js-stars"></span>
+        🎬 <span class="filename">${escapeHtml(video.name)}</span>
+        ${vBest > 0 ? `<span class="stars" style="margin-left:4px">${starsHtml(vBest)}</span>` : ""}
         <button class="card-open-btn" style="margin-left:auto;padding:3px 8px;font-size:10.5px"
                 title="Открыть файл">↗</button>
       </div>
       <div class="frames-strip"></div>`;
 
-    sec.querySelector(".js-stars").replaceWith(starControl(video));
     sec.querySelector(".card-open-btn").addEventListener("click", e => {
       e.stopPropagation(); openLocation(video.path);
     });
 
     // One gallery entry per video: every frame opens the same item
     const galleryIdx = state.galleryItems.length;
-    state.galleryItems.push({ src: video.path, name: video.name, type: "video", item: video });
+    state.galleryItems.push({ src: video.path, name: video.name, type: "video" });
 
     const strip = sec.querySelector(".frames-strip");
     video.frames.forEach(frame => {
@@ -1064,14 +866,15 @@ function buildCard(folder) {
     const grid = sec.querySelector(".photos-grid");
 
     const makePhotoCell = img => {
+      const iBest = img.best_level || 0;
       const cell = document.createElement("div");
       cell.className = "photo-cell";
       cell.style.position = "relative";
       cell.innerHTML = `
-        <img data-src="${escapeHtml(imageThumbUrl(img.path))}" data-kind="image" alt="${escapeHtml(img.name)}">`;
-      cell.prepend(starControl(img, { cls: "cell-stars" }));
+        <img data-src="${escapeHtml(imageThumbUrl(img.path))}" data-kind="image" alt="${escapeHtml(img.name)}">
+        ${iBest > 0 ? `<span class="file-star">${starsHtml(iBest)}</span>` : ""}`;
       const idx = state.galleryItems.length;
-      state.galleryItems.push({ src: img.path, name: img.name, type: "image", item: img });
+      state.galleryItems.push({ src: img.path, name: img.name, type: "image" });
       cell.addEventListener("click", () => openModal("image", img.path, img.name, idx));
       return cell;
     };
@@ -1123,7 +926,7 @@ let observer = null;
 // A thumbnail loads only after staying near the screen for LAZY_DWELL_MS:
 // flicking through a long list used to start a frame extraction for every
 // video it passed (180 frames for 15 left on screen), which kept the CPU busy
-// for minutes and queued the player's own requests behind them.
+// for minutes.
 const LAZY_DWELL_MS = 150;
 
 function setupLazyLoad(reset = false) {
@@ -1245,7 +1048,6 @@ async function loadTagView(name, fresh = true) {
   try {
     const data = await api(url + (fresh ? "&fresh=1" : ""));
     if (seq !== loadSeq) return;
-    state.rootResolved = data.root;
 
     const badge = document.getElementById(v.badge);
     badge.textContent = data.total;
@@ -1359,18 +1161,8 @@ function openModal(type, src, name, galleryIdx) {
 }
 
 function renderModal(type, src, name) {
-  const title = document.getElementById("modal-title");
-  title.textContent = name;
-  title.dataset.path = src;  // kept in sync if the item gets renamed (stars)
-  // The current path, not `src`: the item may get renamed while shown (stars)
-  document.getElementById("modal-open").onclick = () => openLocation(title.dataset.path);
-
-  // Stars of the shown item; the control shares the data object with the card
-  const g = state.galleryItems[state.galleryIdx];
-  const item = g?.src === src && g.item ? g.item : { path: src, name, best_level: 0 };
-  const slot = document.getElementById("modal-stars");
-  slot.innerHTML = "";
-  slot.appendChild(starControl(item, { cls: "modal-stars" }));
+  document.getElementById("modal-title").textContent = name;
+  document.getElementById("modal-open").onclick = () => openLocation(src);
 
   const body = document.getElementById("modal-body");
   stopModalVideo();
@@ -1399,7 +1191,7 @@ function renderModal(type, src, name) {
                <p>Возможно, файл переместили или диск отключён.</p>`}
           <button class="btn-primary">Показать в Finder</button>
         </div>`;
-      body.querySelector("button").addEventListener("click", () => openLocation(title.dataset.path));
+      body.querySelector("button").addEventListener("click", () => openLocation(src));
     });
     body.appendChild(v);
   } else {
@@ -1767,20 +1559,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("keydown", e => {
     if (document.getElementById("modal").classList.contains("hidden")) return;
     if (e.key === "Escape") closeModal();
-    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
-      // Arrows switch items. Without preventDefault a focused video also
-      // seeked on the same key press (seek with the progress bar instead).
-      e.preventDefault();
-      (e.key === "ArrowLeft" ? modalPrev : modalNext).click();
-    }
-    // Fast rating while browsing: 1–3 set that many stars, 0 clears
-    if (/^[0-3]$/.test(e.key) && !e.metaKey && !e.ctrlKey && !e.altKey) {
-      const ctl = document.querySelector("#modal-stars .star-ctl");
-      if (ctl && +ctl.dataset.level !== +e.key) {
-        e.preventDefault();
-        setStars(ctl.dataset.path, +e.key);
-      }
-    }
+    if (e.key === "ArrowLeft") modalPrev.click();
+    if (e.key === "ArrowRight") modalNext.click();
   });
 
   // Clear thumbnail cache
