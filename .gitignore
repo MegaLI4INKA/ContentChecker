@@ -13,3 +13,7 @@ venv/
 
 # JetBrains: machine-specific interpreter settings (the rest of .idea stays tracked)
 .idea/misc.xml
+
+# File index (SQLite): rebuilt automatically, safe to delete
+.index.db
+.index.db-*

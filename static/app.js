@@ -18,6 +18,8 @@ const state = {
   favLevel: 0,
   favMediaFilter: "all",  // "all" | "videos" | "photos"
   wpMediaFilter: "all",   // "all" | "videos" | "photos" — wallpapers tab
+  tagQuery: localStorage.getItem("cc_tag_query") || "",  // Теги tab, e.g. "_best_ah"
+  tgMediaFilter: "all",   // "all" | "videos" | "photos" — Теги tab
   galleryItems: [],
   galleryIdx: 0,
   videoSpeed: 1,          // playback rate in the viewer, kept between videos and visits
@@ -75,7 +77,7 @@ function categoriesUrl() {
 async function load() {
   if (!state.root) return;
   localStorage.setItem("cc_root", state.root);
-  if (state.page === "favorites" || state.page === "wallpapers") {
+  if (state.page in TAG_VIEWS) {
     await loadTagView(state.page);
   } else {
     await loadBrowse();
@@ -1043,7 +1045,27 @@ const TAG_VIEWS = {
           <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
         </svg>
         <p>Нет файлов/папок с пометкой _best</p>
-        <p style="font-size:12px;color:var(--text-mute)">Добавьте суффикс _best к именам файлов или папок</p>
+        <p style="font-size:12px;color:var(--text-mute)">Добавьте тег _best к имени файла или папки</p>
+      </div>`,
+  },
+  tags: {
+    area: "tags-area", list: "tg-list", count: "tg-count", badge: null,
+    photoControls: "tg-photo-controls",
+    labels: { icon: "🏷", folders: "Папки", videos: "Видео", photos: "Фото" },
+    media: () => state.tgMediaFilter,
+    url: () => `/api/tags?root=${encodeURIComponent(state.root)}` +
+               `&q=${encodeURIComponent(state.tagQuery)}&media=${state.tgMediaFilter}`,
+    loadingText: "Поиск по тегам...",
+    // Nothing typed yet: a hint instead of a request
+    idleHtml: () => state.tagQuery.replace(/[_\s]/g, "") ? null : `
+      <div class="empty-state" style="height:300px">
+        <p>Введите теги, например <b>_best_ah</b></p>
+        <p style="font-size:12px;color:var(--text-mute)">Найдутся файлы и папки, у которых в имени есть все эти теги, в любом порядке.
+          <br>_best_best — две звезды и больше</p>
+      </div>`,
+    emptyHtml: `
+      <div class="empty-state" style="height:300px">
+        <p>Нет файлов и папок со всеми этими тегами</p>
       </div>`,
   },
   wallpapers: {
@@ -1073,6 +1095,18 @@ async function loadTagView(name, fresh = true) {
   document.getElementById(v.photoControls).classList.toggle("hidden", v.media() !== "photos");
 
   const list = document.getElementById(v.list);
+  const idle = v.idleHtml?.();
+  if (idle) {
+    ++loadSeq;  // drop a response still on its way
+    pagers[name].start(null);
+    list.innerHTML = idle;
+    document.getElementById(v.count).textContent = "";
+    v.pendingFresh ||= fresh;  // the tab was opened: the first search re-walks
+    return;
+  }
+  fresh ||= v.pendingFresh;
+  v.pendingFresh = false;
+
   list.innerHTML = `<div class="loading"><div class="spinner"></div><p>${v.loadingText}</p></div>`;
   const url = v.url();
   pagers[name].start(url);
@@ -1081,9 +1115,11 @@ async function loadTagView(name, fresh = true) {
     const data = await api(url + (fresh ? "&fresh=1" : ""));
     if (seq !== loadSeq) return;
 
-    const badge = document.getElementById(v.badge);
-    badge.textContent = data.total;
-    badge.classList.toggle("hidden", !data.total);
+    const badge = v.badge && document.getElementById(v.badge);
+    if (badge) {
+      badge.textContent = data.total;
+      badge.classList.toggle("hidden", !data.total);
+    }
     const c = data.counts;
     document.getElementById(v.count).textContent = `${c.folders} папок · ${c.videos + c.photos} файлов`;
 
@@ -1329,6 +1365,7 @@ function switchPage(page) {
   document.getElementById("toolbar").classList.toggle("hidden", !isBrowse);
   document.getElementById("fav-area").classList.toggle("hidden", !isFav);
   document.getElementById("wallpaper-area").classList.toggle("hidden", !isWp);
+  document.getElementById("tags-area").classList.toggle("hidden", page !== "tags");
   document.getElementById("best-section")?.classList.toggle("hidden", !isBrowse);
   load();
 }
@@ -1423,8 +1460,8 @@ document.addEventListener("DOMContentLoaded", () => {
   // Photo size buttons
   document.querySelectorAll(".size-btn").forEach(btn => {
     btn.addEventListener("click", () => {
-      document.querySelectorAll(".size-btn, .fav-size-btn, .wp-size-btn").forEach(b => b.classList.remove("active"));
-      document.querySelectorAll(`.size-btn[data-size="${btn.dataset.size}"], .fav-size-btn[data-size="${btn.dataset.size}"], .wp-size-btn[data-size="${btn.dataset.size}"]`)
+      document.querySelectorAll(".size-btn, .fav-size-btn, .wp-size-btn, .tg-size-btn").forEach(b => b.classList.remove("active"));
+      document.querySelectorAll(`.size-btn[data-size="${btn.dataset.size}"], .fav-size-btn[data-size="${btn.dataset.size}"], .wp-size-btn[data-size="${btn.dataset.size}"], .tg-size-btn[data-size="${btn.dataset.size}"]`)
         .forEach(b => b.classList.add("active"));
       state.photoSize = btn.dataset.size;
       // Re-apply size class to all grids without full reload
@@ -1441,10 +1478,10 @@ document.addEventListener("DOMContentLoaded", () => {
   ratioBtn.addEventListener("click", () => {
     state.naturalRatio = !state.naturalRatio;
     const label = state.naturalRatio ? "Авто" : "1:1";
-    ["ratio-btn", "fav-ratio-btn", "wp-ratio-btn"].forEach(id =>
+    ["ratio-btn", "fav-ratio-btn", "wp-ratio-btn", "tg-ratio-btn"].forEach(id =>
       document.getElementById(id)?.classList.toggle("active", state.naturalRatio)
     );
-    ["ratio-label", "fav-ratio-label", "wp-ratio-label"].forEach(id => {
+    ["ratio-label", "fav-ratio-label", "wp-ratio-label", "tg-ratio-label"].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.textContent = label;
     });
@@ -1459,7 +1496,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const showTextsBtn   = document.getElementById("show-texts-btn");
   showTextsBtn.addEventListener("click", () => {
     state.showTexts = !state.showTexts;
-    ["show-texts-btn", "fav-show-texts-btn", "wp-show-texts-btn"].forEach(id =>
+    ["show-texts-btn", "fav-show-texts-btn", "wp-show-texts-btn", "tg-show-texts-btn"].forEach(id =>
       document.getElementById(id)?.classList.toggle("active", state.showTexts)
     );
     document.querySelectorAll(".photo-texts-wrap").forEach(w => {
@@ -1560,10 +1597,32 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  // Photo size buttons across all pages (share state.photoSize)
-  document.querySelectorAll(".fav-size-btn, .wp-size-btn").forEach(btn => {
+  // Теги tab: media filter and the tag search field (searched as you type)
+  document.querySelectorAll("[data-tg-filter]").forEach(btn => {
     btn.addEventListener("click", () => {
-      document.querySelectorAll(".fav-size-btn, .wp-size-btn").forEach(b => b.classList.remove("active"));
+      document.querySelectorAll("[data-tg-filter]").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      state.tgMediaFilter = btn.dataset.tgFilter;
+      loadTagView("tags", false);
+    });
+  });
+  const tagInput = document.getElementById("tag-search-input");
+  const tagClear = document.getElementById("tag-search-clear");
+  const setTagQuery = q => {
+    state.tagQuery = q;
+    localStorage.setItem("cc_tag_query", q);
+    tagClear.classList.toggle("hidden", !q);
+    if (state.root) loadTagView("tags", false);
+  };
+  tagInput.value = state.tagQuery;
+  tagClear.classList.toggle("hidden", !state.tagQuery);
+  tagInput.addEventListener("input", debounce(e => setTagQuery(e.target.value), 350));
+  tagClear.addEventListener("click", () => { tagInput.value = ""; setTagQuery(""); tagInput.focus(); });
+
+  // Photo size buttons across all pages (share state.photoSize)
+  document.querySelectorAll(".fav-size-btn, .wp-size-btn, .tg-size-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".fav-size-btn, .wp-size-btn, .tg-size-btn").forEach(b => b.classList.remove("active"));
       document.querySelectorAll(".size-btn").forEach(b =>
         b.classList.toggle("active", b.dataset.size === btn.dataset.size)
       );
@@ -1579,10 +1638,10 @@ document.addEventListener("DOMContentLoaded", () => {
   function toggleRatio() {
     state.naturalRatio = !state.naturalRatio;
     const label = state.naturalRatio ? "Авто" : "1:1";
-    ["ratio-btn", "fav-ratio-btn", "wp-ratio-btn"].forEach(id =>
+    ["ratio-btn", "fav-ratio-btn", "wp-ratio-btn", "tg-ratio-btn"].forEach(id =>
       document.getElementById(id)?.classList.toggle("active", state.naturalRatio)
     );
-    ["ratio-label", "fav-ratio-label", "wp-ratio-label"].forEach(id => {
+    ["ratio-label", "fav-ratio-label", "wp-ratio-label", "tg-ratio-label"].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.textContent = label;
     });
@@ -1595,11 +1654,12 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   document.getElementById("fav-ratio-btn").addEventListener("click", toggleRatio);
   document.getElementById("wp-ratio-btn").addEventListener("click", toggleRatio);
+  document.getElementById("tg-ratio-btn").addEventListener("click", toggleRatio);
 
   // Texts toggle across all pages (shares state.showTexts)
   function toggleTexts() {
     state.showTexts = !state.showTexts;
-    ["show-texts-btn", "fav-show-texts-btn", "wp-show-texts-btn"].forEach(id =>
+    ["show-texts-btn", "fav-show-texts-btn", "wp-show-texts-btn", "tg-show-texts-btn"].forEach(id =>
       document.getElementById(id)?.classList.toggle("active", state.showTexts)
     );
     document.querySelectorAll(".photo-texts-wrap").forEach(w =>
@@ -1608,6 +1668,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   document.getElementById("fav-show-texts-btn").addEventListener("click", toggleTexts);
   document.getElementById("wp-show-texts-btn").addEventListener("click", toggleTexts);
+  document.getElementById("tg-show-texts-btn").addEventListener("click", toggleTexts);
 
   // Modal
   const speedSelect = document.getElementById("modal-speed");
@@ -1678,6 +1739,8 @@ document.addEventListener("DOMContentLoaded", () => {
                                  onPage: data => appendTagPage("favorites", data) });
   pagers.wallpapers = new Pager({ page: "wallpapers", sentinel: "wp-load-more", scrollRoot: "wp-content",
                                   onPage: data => appendTagPage("wallpapers", data) });
+  pagers.tags = new Pager({ page: "tags", sentinel: "tg-load-more", scrollRoot: "tg-content",
+                            onPage: data => appendTagPage("tags", data) });
 
   // The app opens on Favorites (the welcome screen until a folder is chosen)
   if (state.root) {

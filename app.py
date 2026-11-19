@@ -4,6 +4,7 @@ import io
 import json
 import os
 import platform
+import re
 import subprocess
 import hashlib
 import ipaddress
@@ -11,16 +12,18 @@ import logging
 import threading
 import time
 import unicodedata
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from file_index import Dir as IndexDir, File as IndexFile, FileIndex, Tree, WalkedTree, like_tag, walk_tree
 
 try:  # HEIC/HEIF support for Pillow (optional dependency)
     from pillow_heif import register_heif_opener
@@ -167,17 +170,27 @@ def fold(s: str) -> str:
 def _tag_base(name: str, is_dir: bool) -> str:
     """Part of the name that carries tags, lowercased. Folders have no extension,
     so 'Paris.2023_best' must not be cut down to 'Paris'."""
-    return (name if is_dir else Path(name).stem).lower()
+    return (name if is_dir else os.path.splitext(name)[0]).lower()
+
+
+_TAG_SEP = re.compile(r"[_\s]+")
+
+
+def name_tags(name: str, is_dir: bool = False) -> list[str]:
+    """Tags of a name: the words after its first "_", separated by "_" or
+    spaces, case-insensitive. 'clip_best_ah.mp4' → ['best', 'ah'],
+    'Trip_best copy' → ['best', 'copy']. What comes before the first "_" is
+    the name itself, not a tag ('best_of.jpg' has no tags)."""
+    base = name if is_dir else os.path.splitext(name)[0]
+    _, sep, rest = base.partition("_")
+    return [t for t in _TAG_SEP.split(fold(rest)) if t] if sep else []
 
 
 def parse_best_level(name: str, is_dir: bool = False) -> int:
-    """Count trailing _best tokens in the name (max 3)."""
-    base = _tag_base(name, is_dir)
-    count = 0
-    while base.endswith("_best"):
-        count += 1
-        base = base[:-5]
-    return min(count, 3)
+    """Stars: how many _best tags the name has, wherever they are among its
+    tags (max 3) — 'clip_best_ah.mp4' is 1 star, 'clip_best_ah_best.mp4' 2.
+    Only trailing ones used to count."""
+    return min(name_tags(name, is_dir).count("best"), 3)
 
 
 def has_wallpaper_tag(name: str, is_dir: bool = False) -> bool:
@@ -239,32 +252,6 @@ def is_file(e: os.DirEntry) -> bool:
 
 def subdirs(p: Path) -> list[Path]:
     return [Path(e.path) for e in list_dir(p) or [] if is_dir(e)]
-
-
-def walk_dirs(top: Path, max_depth: Optional[int] = None) -> Iterator[tuple[Path, list[os.DirEntry]]]:
-    """Depth-first (pre-order) walk yielding (dir, visible entries). Unreadable dirs
-    are skipped and every real directory is visited once, so symlink loops can't
-    multiply results or recurse forever."""
-    seen: set[tuple[int, int]] = set()
-
-    def _walk(p: Path, depth: int):
-        try:
-            st = p.stat()
-        except OSError:
-            return
-        if (st.st_dev, st.st_ino) in seen:
-            return
-        seen.add((st.st_dev, st.st_ino))
-        entries = list_dir(p)
-        if entries is None:
-            return
-        yield p, entries
-        if max_depth is None or depth < max_depth:
-            for e in entries:
-                if is_dir(e):
-                    yield from _walk(Path(e.path), depth + 1)
-
-    yield from _walk(top, 0)
 
 
 def subfolder_info(e: Path, root_path: Path) -> dict:
@@ -534,6 +521,77 @@ def _listing_put(key: tuple, value) -> None:
             _listing_cache.popitem(last=False)
 
 
+# ── File index ────────────────────────────────────────────────────────────────
+# Everything that needs a whole tree (Favorites, Wallpapers, Теги, "Всё в одном
+# списке", folder search, categories) reads it from the SQLite index
+# (file_index.py) instead of walking the disk each time. Single folders are
+# still listed live (cards, the sidebar tree, "+N ещё").
+
+# Bump when what's read from names changes (stars, tags, _wallpaper, media
+# types): the index is then rebuilt from scratch.
+INDEX_VERSION = 1
+# How long a listing waits for the index to catch up with the disk; whatever
+# isn't checked by then is finished in the background (the next visit has it).
+# A tree seen for the first time is always waited for.
+REFRESH_WAIT = 1.0
+# Sidebar searches and categories refresh the index at most this often (s)
+REFRESH_INTERVAL = 30
+
+
+def _index_listing(path: str) -> Optional[tuple[list[str], list[tuple[str, str]], bool]]:
+    """What the index keeps of one folder: subfolder names, media files, and
+    whether media lies directly in it."""
+    entries = list_dir(path)
+    if entries is None:
+        return None
+    sub, media = [], []
+    for e in entries:
+        if is_dir(e):
+            sub.append(e.name)
+        elif (kind := media_type(e)) in ("video", "image") and is_file(e):
+            media.append((e.name, kind))
+    return sub, media, bool(media)
+
+
+def _index_meta(name: str, folder: bool) -> tuple[int, bool, list[str]]:
+    tags = name_tags(name, folder)
+    # = parse_best_level(), without parsing the name a second time
+    return min(tags.count("best"), 3), has_wallpaper_tag(name, folder), tags
+
+
+def _open_index() -> Optional[FileIndex]:
+    try:
+        return FileIndex(BASE_DIR / ".index.db", INDEX_VERSION, _index_listing, _index_meta, fold)
+    except Exception as e:  # no sqlite3, folder not writable, disk full…
+        log.warning("Index unavailable (%s): folders are walked on disk every time, "
+                    "as before the index", e)
+        return None
+
+
+INDEX = _open_index()
+_index_warned_at = -1e9
+
+
+def from_tree(root: Path, use: Callable[[Tree | WalkedTree], object],
+              wait: Optional[float] = 0, min_interval: float = 0):
+    """use(tree of root): the tree from the index, brought up to date first
+    (see FileIndex.refresh for wait/min_interval). Whenever the index can't
+    be used — not set up, locked, damaged, a refresh failed — the tree is
+    walked on disk right now instead: slower, but the same result."""
+    global _index_warned_at
+    if INDEX is not None:
+        try:
+            INDEX.refresh(str(root), wait=wait, min_interval=min_interval)
+            return use(INDEX.tree(str(root)))
+        except Exception as e:
+            if time.monotonic() - _index_warned_at > 60:  # don't flood the log
+                _index_warned_at = time.monotonic()
+                log.warning("Index failed (%s: %s): walking %s on disk instead",
+                            type(e).__name__, e, root)
+            INDEX.recover(e)
+    return use(walk_tree(str(root), _index_listing, _index_meta))
+
+
 def browse_candidates(cur: Path, dirs: list[Path], recursive: bool, cat_filter: set[str],
                       search_folder_lower: str, min_folder_best: int,
                       with_subfolders: bool) -> list[Path]:
@@ -542,10 +600,8 @@ def browse_candidates(cur: Path, dirs: list[Path], recursive: bool, cat_filter: 
     # Recursive in flat mode / any deep search, OR when category filter is active
     # (categories may be deep in the tree, non-recursive scan misses them)
     if recursive or cat_filter:
-        to_scan = [
-            p for p, entries in walk_dirs(cur)
-            if any(media_type(f) in ("video", "image") and is_file(f) for f in entries)
-        ]
+        to_scan = from_tree(cur, lambda t: [Path(d.path) for d in t.dirs if d.has_media],
+                            wait=REFRESH_WAIT)
     elif with_subfolders:
         # Current dir + immediate subfolders
         to_scan = [cur] + dirs
@@ -688,9 +744,11 @@ def search_folders(root: str = Query(...), q: str = Query(...)):
         return {"results": []}
 
     results: list[dict] = []
-    for p, _ in walk_dirs(root_path):
-        if p == root_path or q_lower not in fold(p.name):
+    dirs = from_tree(root_path, lambda t: t.dirs[1:], min_interval=REFRESH_INTERVAL)  # [0] = root
+    for d in dirs:
+        if q_lower not in fold(d.name):
             continue
+        p = Path(d.path)
         rel = p.relative_to(root_path)
         results.append({
             "name": p.name,
@@ -718,9 +776,10 @@ def get_categories(root: str = Query(...), path: str = Query("")):
     root_path = open_root(root)
     cur = open_subdir(root_path, path)
 
-    cats: set[str] = set()
-    for _, entries in walk_dirs(cur, max_depth=8):
-        cats.update(e.name for e in entries if is_dir(e))
+    # Names of the folders up to 9 levels below (this used to walk the disk
+    # on every folder opened)
+    cats = from_tree(cur, lambda t: {d.name for d in t.dirs if 1 <= d.depth <= 9},
+                     min_interval=REFRESH_INTERVAL)
     return {"categories": sorted(cats, key=fold)}
 
 
@@ -1007,27 +1066,18 @@ def media_file_entry(path: str, name: str, folder: Path, ft: str) -> Optional[di
     return entry
 
 
-def collect_tagged(root_path: Path, folder_matches: Callable[[str], bool],
-                   file_matches: Callable[[str], bool]) -> dict:
-    """Walk the tree: tagged folders and tagged media files, by name only."""
-    folders: list[Path] = []
+def collect_tagged(tree: Tree | WalkedTree, folder_ok: Callable[[IndexDir], bool],
+                   file_ok: Callable[[IndexFile], bool], sql: Optional[str] = None,
+                   params: tuple = ()) -> dict:
+    """Tagged folders and tagged media files of the tree, in tree order.
+    folder_ok / file_ok pick them; sql (+ params) is the same file condition
+    for the database, so it does the narrowing when the index is used."""
+    # A tagged folder is listed if media lies directly in it (not the root itself)
+    folders = [Path(d.path) for d in tree.dirs if d.depth > 0 and d.has_media and folder_ok(d)]
     videos: list[tuple] = []
     images: list[tuple] = []
-    for p, entries in walk_dirs(root_path, max_depth=10):
-        tagged_folder = p != root_path and folder_matches(p.name)
-        has_media = False
-        for f in entries:
-            if not (tagged_folder and not has_media) and not file_matches(f.name):
-                continue
-            ft = media_type(f)
-            if ft not in ("video", "image") or not is_file(f):
-                continue
-            has_media = True
-            if file_matches(f.name):
-                (videos if ft == "video" else images).append((f.path, f.name, p))
-        # Like before: a tagged folder is listed if media lies directly in it
-        if tagged_folder and has_media:
-            folders.append(p)
+    for f in tree.files(file_ok, sql, params):
+        (videos if f.kind == "video" else images).append((f.path, f.name, Path(f.dir.path)))
     return {"folders": folders, "videos": videos, "images": images}
 
 
@@ -1075,12 +1125,16 @@ def tagged_page(root_path: Path, tags: dict, level: int, media: str, offset: int
     }
 
 
-def _tags_for(kind: str, root: str, fresh: bool, folder_matches, file_matches) -> tuple[Path, dict]:
+def _tags_for(kind: str, root: str, fresh: bool, *select) -> tuple[Path, dict]:
+    """The tagged listing of a tab. fresh (the tab was opened): bring the index
+    up to date first; otherwise (filters, next pages) reuse the listing."""
     root_path = open_root(root)
     key = ("tags", kind, str(root_path))
     tags = None if fresh else _listing_get(key)
     if tags is None:
-        tags = collect_tagged(root_path, folder_matches, file_matches)
+        tags = from_tree(root_path, lambda t: collect_tagged(t, *select),
+                         wait=REFRESH_WAIT if fresh else 0,
+                         min_interval=0 if fresh else REFRESH_INTERVAL)
         _listing_put(key, tags)
     return root_path, tags
 
@@ -1093,11 +1147,8 @@ def get_favorites(
     offset: int = Query(0, ge=0),
     fresh: bool = Query(False),         # re-walk the tree (tab opened) instead of reusing it
 ):
-    root_path, tags = _tags_for(
-        "favorites", root, fresh,
-        lambda name: parse_best_level(name, is_dir=True) >= 1,
-        lambda name: parse_best_level(name) >= 1,
-    )
+    root_path, tags = _tags_for("favorites", root, fresh,
+                                lambda d: d.best >= 1, lambda f: f.best >= 1, "f.best > 0")
     return tagged_page(root_path, tags, level, media, offset)
 
 
@@ -1108,10 +1159,45 @@ def get_wallpapers(
     offset: int = Query(0, ge=0),
     fresh: bool = Query(False),
 ):
+    root_path, tags = _tags_for("wallpapers", root, fresh,
+                                lambda d: d.wallpaper, lambda f: f.wallpaper, "f.wallpaper = 1")
+    return tagged_page(root_path, tags, 0, media, offset)
+
+
+# ── Tag search ────────────────────────────────────────────────────────────────
+
+def parse_tag_query(q: str) -> Counter:
+    """'_best_ah' (or 'best ah') → {best: 1, ah: 1}. A repeated tag asks for at
+    least that many: '_best_best' = 2 stars or more."""
+    return Counter(t for t in _TAG_SEP.split(fold(q)) if t)
+
+
+@app.get("/api/tags")
+def search_tags(
+    root: str = Query(...),
+    q: str = Query(""),        # tags to look for, e.g. "_best_ah"
+    media: str = Query("all"),
+    offset: int = Query(0, ge=0),
+    fresh: bool = Query(False),  # re-walk the tree (tab opened) instead of reusing it
+):
+    """Files and folders that have ALL the tags of the query, in any order and
+    among any other tags: '_best_ah' finds 'clip_ah_best.mp4' and
+    'Trip_best_x_ah', not 'clip_best.mp4'. Answered from the index, so typing
+    doesn't walk the disk."""
+    need = parse_tag_query(q)
+    if not need:
+        return tagged_page(open_root(root), {"folders": [], "videos": [], "images": []}, 0, media, offset)
+
+    def has_all(tags: str) -> bool:
+        return need <= Counter(tags.split())
+
     root_path, tags = _tags_for(
-        "wallpapers", root, fresh,
-        lambda name: has_wallpaper_tag(name, is_dir=True),
-        has_wallpaper_tag,
+        "q:" + " ".join(sorted(need.elements())), root, fresh,
+        lambda d: has_all(d.tags),
+        lambda f: has_all(f.tags),
+        # the database narrows down by each tag, has_all() checks repeats (_best_best)
+        " AND ".join(["f.tags LIKE ? ESCAPE '\\'"] * len(need)),
+        tuple(like_tag(t) for t in need),
     )
     return tagged_page(root_path, tags, 0, media, offset)
 

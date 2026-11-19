@@ -57,6 +57,13 @@
     Обои
     <span class="tab-badge hidden" id="wp-badge">0</span>
   </button>
+  <button class="tab-btn" data-tab="tags">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/>
+      <line x1="7" y1="7" x2="7.01" y2="7"/>
+    </svg>
+    Теги
+  </button>
 </div>
 
 <!-- LAYOUT -->
@@ -376,6 +383,69 @@
       <div id="wp-content">
         <div id="wp-list" class="tag-list"></div>
         <div id="wp-load-more" class="load-more hidden">
+          <button class="show-more-btn">Загрузить ещё</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAG SEARCH PAGE: files and folders that have all the typed tags -->
+    <div id="tags-area" class="hidden">
+      <div class="fav-toolbar">
+        <div class="sidebar-search-wrap tag-search" title="Теги через _ или пробел: _best_ah — у кого в имени есть и _best, и _ah, в любом порядке. _best_best — две звезды и больше">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/>
+            <line x1="7" y1="7" x2="7.01" y2="7"/>
+          </svg>
+          <input type="text" id="tag-search-input" placeholder="_best_ah" autocomplete="off" spellcheck="false">
+          <button class="sidebar-clear-btn hidden" id="tag-search-clear" title="Очистить">✕</button>
+        </div>
+        <div class="view-buttons" id="tg-media-filter">
+          <button class="view-btn active" data-tg-filter="all">Все</button>
+          <button class="view-btn" data-tg-filter="videos">Видео</button>
+          <button class="view-btn" data-tg-filter="photos">Фото</button>
+        </div>
+        <div id="tg-photo-controls" class="photo-controls hidden">
+          <div class="view-buttons">
+            <button class="tg-size-btn view-btn" data-size="small" title="Мелкие">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="4" height="4" rx="0.5"/><rect x="10" y="3" width="4" height="4" rx="0.5"/>
+                <rect x="17" y="3" width="4" height="4" rx="0.5"/><rect x="3" y="10" width="4" height="4" rx="0.5"/>
+                <rect x="10" y="10" width="4" height="4" rx="0.5"/><rect x="17" y="10" width="4" height="4" rx="0.5"/>
+                <rect x="3" y="17" width="4" height="4" rx="0.5"/><rect x="10" y="17" width="4" height="4" rx="0.5"/>
+                <rect x="17" y="17" width="4" height="4" rx="0.5"/>
+              </svg>
+            </button>
+            <button class="tg-size-btn view-btn active" data-size="medium" title="Средние">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="8" rx="1"/>
+                <rect x="3" y="13" width="8" height="8" rx="1"/><rect x="13" y="13" width="8" height="8" rx="1"/>
+              </svg>
+            </button>
+            <button class="tg-size-btn view-btn" data-size="large" title="Крупные">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="18" height="18" rx="2"/>
+              </svg>
+            </button>
+          </div>
+          <button class="ratio-btn" id="tg-ratio-btn" title="Переключить соотношение сторон">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="5" width="18" height="14" rx="1.5"/>
+            </svg>
+            <span id="tg-ratio-label">1:1</span>
+          </button>
+          <button class="ratio-btn" id="tg-show-texts-btn" title="Показать/скрыть текстовые файлы">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/>
+              <line x1="3" y1="18" x2="14" y2="18"/>
+            </svg>
+            <span>Тексты</span>
+          </button>
+        </div>
+        <span id="tg-count" class="toolbar-info"></span>
+      </div>
+      <div id="tg-content">
+        <div id="tg-list" class="tag-list"></div>
+        <div id="tg-load-more" class="load-more hidden">
           <button class="show-more-btn">Загрузить ещё</button>
         </div>
       </div>
